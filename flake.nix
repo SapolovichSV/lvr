@@ -37,15 +37,20 @@
             glfw
             xorg.libX11
             wayland
+            vulkan-loader
+            vulkan-tools
+            vulkan-headers
           ];
 
           # Переменные окружения для Rust
           RUST_BACKTRACE = "1";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
-
+          LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.glfw}/lib";
           shellHook = ''
             echo "Rust stable: $(rustc --version)"
             echo "Cargo: $(cargo --version)"
+            echo "Vulkan loader: $(find ${pkgs.vulkan-loader}/lib -name libvulkan.so*)"
+            vulkaninfo | grep "Vulkan API version"
           '';
         };
       }

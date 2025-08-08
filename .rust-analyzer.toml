@@ -1,0 +1,7 @@
+[check]
+command = "clippy"  # Использовать Clippy вместо `check`
+
+[cargo]
+features = "all"    # Включить все фичи
+
+
