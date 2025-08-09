@@ -40,6 +40,7 @@
             vulkan-loader
             vulkan-tools
             vulkan-headers
+            vulkan-validation-layers
           ];
 
           # Переменные окружения для Rust
