@@ -58,6 +58,121 @@ fn check_layers(entry: &ash::Entry) {
     }
     log::info!("layer properties: {layer_properties:?}");
 }
+fn create_instance(
+    glfw_extensions: Vec<String>,
+    app_info: &vk::ApplicationInfo<'_>,
+    entry: &ash::Entry,
+    layers: &CStringArray,
+    debug_create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT,
+) -> ash::Instance {
+    let enabled_layer_c_names = layers.as_ptr();
+    let len_ext_names = glfw_extensions.len();
+    let extension_names = vec_strings_to_ptptr(glfw_extensions);
+    let create_info = vk::InstanceCreateInfo {
+        p_application_info: app_info,
+        enabled_extension_count: len_ext_names as u32,
+        pp_enabled_extension_names: extension_names,
+        enabled_layer_count: LAYERS_TO_ENABLE.len() as u32,
+        pp_enabled_layer_names: enabled_layer_c_names,
+        ..Default::default()
+    }
+    .push_next(debug_create_info);
+    unsafe {
+        entry
+            .create_instance(&create_info, None)
+            .expect("can't create instance")
+    }
+}
+fn select_physical_device(
+    instance: &ash::Instance,
+    device_extension: &Vec<&CStr>,
+) -> vk::PhysicalDevice {
+    let devices: Vec<vk::PhysicalDevice> = unsafe {
+        instance
+            .enumerate_physical_devices()
+            .expect("Can't enumerate physical devices")
+    };
+    if devices.is_empty() {
+        panic!();
+    }
+    log::debug!("devices: {devices:#?}");
+
+    let mut main_device = Default::default();
+    devices.iter().for_each(|device| {
+        if is_device_suitable(device, instance, device_extension) {
+            log::debug!("device {device:?} is suitable");
+            main_device = *device;
+        }
+    });
+    main_device
+}
+fn create_logical_device(
+    device_extension: Vec<&CStr>,
+    instance: &ash::Instance,
+    log_device_create_info: vk::DeviceQueueCreateInfo<'_>,
+    main_device: vk::PhysicalDevice,
+) -> ash::Device {
+    let mut physical_device_features2: vk::PhysicalDeviceFeatures2 =
+        vk::PhysicalDeviceFeatures2::default();
+    let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
+        dynamic_rendering: vk::TRUE,
+        p_next: &mut physical_device_features2 as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+    let mut extended_state_features_ext = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+        extended_dynamic_state: vk::TRUE,
+        p_next: &mut vulkan13_features as *mut _ as *mut std::ffi::c_void,
+        ..Default::default()
+    };
+
+    let len_of_device_extensions = device_extension.len();
+    // must live as long as device or SEGFAULT_CORE_DUMPED))))
+    let vec_with_cstrings = CStringArray::from(device_extension);
+    let device_create_info = vk::DeviceCreateInfo {
+        p_next: &mut extended_state_features_ext as *mut _ as *mut std::ffi::c_void,
+        queue_create_info_count: 1,
+        p_queue_create_infos: &log_device_create_info,
+        enabled_extension_count: len_of_device_extensions as u32,
+        pp_enabled_extension_names: vec_with_cstrings.as_ptr(),
+        ..Default::default()
+    };
+    unsafe {
+        instance
+            .create_device(main_device, &device_create_info, None)
+            .expect("Failed to create vk::Device")
+    }
+}
+extern "system" fn callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _p_user_data: *mut std::ffi::c_void,
+) -> vk::Bool32 {
+    use vk::DebugUtilsMessageSeverityFlagsEXT as Severity;
+
+    let callback_data = unsafe { *p_callback_data };
+    let message = unsafe { std::ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy() };
+
+    // Выводим сообщение в зависимости от его уровня важности
+    match message_severity {
+        Severity::ERROR => {
+            eprintln!("[Vulkan ERROR] my print{message_type:?}: {message}");
+        }
+        Severity::WARNING => {
+            println!("[Vulkan WARNING] {message_type:?}: {message}");
+        }
+        Severity::INFO => {
+            println!("[Vulkan INFO] {message_type:?}: {message}");
+        }
+        Severity::VERBOSE => {
+            println!("[Vulkan VERBOSE] {message_type:?}: {message}");
+        }
+        _ => (),
+    }
+
+    // Возвращаем VK_FALSE, чтобы не прерывать выполнение
+    vk::FALSE
+}
 fn main() {
     env_logger::init();
     log::info!("Initialized logger");
@@ -70,6 +185,19 @@ fn main() {
         api_version: vk::make_api_version(0, 1, 4, 0),
         ..Default::default()
     };
+    let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+        .message_severity(
+            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+        )
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+        )
+        .pfn_user_callback(Some(callback));
     check_layers(&entry);
 
     let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
@@ -97,31 +225,15 @@ fn main() {
     }
     // must live as long as app and dropped manually at the end
     let layers = CStringArray::from(LAYERS_TO_ENABLE);
-    let enabled_layer_c_names = layers.as_ptr();
-    let len_ext_names = glfw_extensions.len();
-    let extension_names = vec_strings_to_ptptr(glfw_extensions);
-    let create_info = vk::InstanceCreateInfo {
-        p_application_info: &app_info,
-        enabled_extension_count: len_ext_names as u32,
-        pp_enabled_extension_names: extension_names,
-        enabled_layer_count: LAYERS_TO_ENABLE.len() as u32,
-        pp_enabled_layer_names: enabled_layer_c_names,
-        ..Default::default()
-    };
-    let instance: ash::Instance = unsafe {
-        entry
-            .create_instance(&create_info, None)
-            .expect("can't create instance")
-    };
-    let devices: Vec<vk::PhysicalDevice> = unsafe {
-        instance
-            .enumerate_physical_devices()
-            .expect("Can't enumerate physical devices")
-    };
-    if devices.is_empty() {
-        panic!();
-    }
-    log::debug!("devices: {devices:#?}");
+    let instance = create_instance(
+        glfw_extensions,
+        &app_info,
+        &entry,
+        &layers,
+        &mut debug_create_info,
+    );
+
+    // select physical device
 
     let device_extension: Vec<&CStr> = vec![
         khr::swapchain::NAME,
@@ -129,14 +241,26 @@ fn main() {
         khr::synchronization2::NAME,
         khr::create_renderpass2::NAME,
     ];
+    let main_device = select_physical_device(&instance, &device_extension);
+    //logical device
+    let queue_family_properties =
+        unsafe { instance.get_physical_device_queue_family_properties(main_device) };
+    let graphics_index = queue_family_properties
+        .iter()
+        .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        .unwrap();
 
-    let mut main_device = Default::default();
-    devices.iter().for_each(|device| {
-        if is_device_suitable(device, &instance, &device_extension) {
-            log::debug!("device {device:?} is suitable");
-            main_device = *device;
-        }
-    });
+    // create this var for sure what ptr will be valid as long as app run
+    let queue_priority = 0.0f32;
+    let log_device = vk::DeviceQueueCreateInfo {
+        queue_family_index: graphics_index as u32,
+        p_queue_priorities: std::ptr::addr_of!(queue_priority),
+        queue_count: 1,
+        ..Default::default()
+    };
+    let device = create_logical_device(device_extension, &instance, log_device, main_device);
+
+    let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
 
     while !window.should_close() {
         // Swap front and back buffers
@@ -151,6 +275,7 @@ fn main() {
             }
         }
     }
+    unsafe { device.destroy_device(None) };
     unsafe { instance.destroy_instance(None) };
     mem::drop(layers);
 }
@@ -186,6 +311,15 @@ struct CStringArray {
 impl CStringArray {
     fn as_ptr(&self) -> *const *const i8 {
         self.ptrs.as_ptr()
+    }
+}
+impl From<Vec<&CStr>> for CStringArray {
+    fn from(value: Vec<&CStr>) -> Self {
+        log::trace!("From<Vec<&CStr>> -> CStringArray");
+        let _holder: Vec<CString> = value.clone().iter().map(|x| CString::from(*x)).collect();
+        let ptrs: Vec<*const i8> = _holder.iter().map(|x| x.as_ptr()).collect();
+        // dont sure will it segfault or no so just clone, will see
+        Self { _holder, ptrs }
     }
 }
 impl From<&[&str]> for CStringArray {
