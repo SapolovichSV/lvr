@@ -6,9 +6,9 @@ use std::{
 
 use ash::{
     Entry, khr,
-    vk::{self, PhysicalDeviceType},
+    vk::{self, Handle, PhysicalDeviceType},
 };
-use glfw::{self, Action, Context, Key};
+use glfw::{self, Action, Key, ffi::VkInstance_T};
 static SCREEN_WIDTH: u32 = 1920;
 static SCREEN_HEIGHT: u32 = 1080;
 const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
@@ -16,6 +16,10 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
 #[cfg(not(debug_assertions))]
 const layers_to_enable: &[&str] = &[]; // В релизе слои отключены
+// struct VulkanApp {
+//     glfw_var: glfw::Glfw,
+//     window: glfw::
+// }
 
 fn init_window(
     width: u32,
@@ -28,11 +32,11 @@ fn init_window(
 ) {
     use glfw::fail_on_errors;
     let mut glfw = glfw::init(fail_on_errors!()).expect("Failed to init glfw init");
+    glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
 
     let (mut window, events) = glfw
         .create_window(width, height, window_name, glfw::WindowMode::Windowed)
         .expect("Failed to create window");
-    window.make_current();
     window.set_key_polling(true);
     (glfw, window, events)
 }
@@ -232,6 +236,19 @@ fn main() {
         &layers,
         &mut debug_create_info,
     );
+    // pick window surface
+    let surface = unsafe {
+        let mut surface: vk::SurfaceKHR = vk::SurfaceKHR::null();
+        log::trace!("SurfaceKHR::null()");
+        let instance = instance.handle().as_raw() as *mut VkInstance_T;
+        log::trace!("instance.handle() ...");
+        let surface_ptr: *mut vk::SurfaceKHR = &mut surface;
+        // let mut surf = [std::ptr::from_ref(&surface).cast_mut()].as_mut_ptr();
+        log::trace!("before trying create window");
+        window.create_window_surface(instance, std::ptr::null(), surface_ptr as *mut _);
+        log::trace!("after");
+        surface
+    };
 
     // select physical device
 
@@ -262,9 +279,37 @@ fn main() {
 
     let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
 
+    let surf_instance = khr::surface::Instance::new(&entry, &instance);
+
+    let present_supported: bool = unsafe {
+        surf_instance
+            .get_physical_device_surface_support(main_device, graphics_index as u32, surface)
+            .unwrap()
+    };
+    log::trace!("present supported {present_supported:?}");
+    let present_index = match present_supported {
+        true => graphics_index,
+        false => panic!(),
+    };
+    let present_queue = unsafe { device.get_device_queue(present_index as u32, 0) };
+    let surface_capabilites = unsafe {
+        surf_instance
+            .get_physical_device_surface_capabilities(main_device, surface)
+            .unwrap()
+    };
+    let available_formats = unsafe {
+        surf_instance
+            .get_physical_device_surface_formats(main_device, surface)
+            .unwrap()
+    };
+    let available_present_modes = unsafe {
+        surf_instance
+            .get_physical_device_surface_present_modes(main_device, surface)
+            .unwrap()
+    };
+
     while !window.should_close() {
         // Swap front and back buffers
-        window.swap_buffers();
 
         // Poll for and process events
         glfw.poll_events();
