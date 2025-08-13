@@ -5,10 +5,11 @@ use std::{
 };
 
 use ash::{
-    Entry, khr,
+    Entry,
+    khr::{self},
     vk::{self, Handle, PhysicalDeviceType},
 };
-use glfw::{self, Action, Key, ffi::VkInstance_T};
+use glfw::{self, Action, GlfwReceiver, Key, ffi::VkInstance_T};
 static SCREEN_WIDTH: u32 = 1920;
 static SCREEN_HEIGHT: u32 = 1080;
 const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
@@ -16,30 +17,104 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
 #[cfg(not(debug_assertions))]
 const layers_to_enable: &[&str] = &[]; // В релизе слои отключены
-// struct VulkanApp {
-//     glfw_var: glfw::Glfw,
-//     window: glfw::
-// }
-
-fn init_window(
-    width: u32,
-    height: u32,
-    window_name: &str,
-) -> (
-    glfw::Glfw,
-    glfw::PWindow,
-    glfw::GlfwReceiver<(f64, glfw::WindowEvent)>,
-) {
-    use glfw::fail_on_errors;
-    let mut glfw = glfw::init(fail_on_errors!()).expect("Failed to init glfw init");
-    glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
-
-    let (mut window, events) = glfw
-        .create_window(width, height, window_name, glfw::WindowMode::Windowed)
-        .expect("Failed to create window");
-    window.set_key_polling(true);
-    (glfw, window, events)
+struct VulkanApp {
+    glfw_var: glfw::Glfw,
+    window: glfw::PWindow,
+    events: GlfwReceiver<(f64, glfw::WindowEvent)>,
+    instance: ash::Instance,
+    entry: ash::Entry,
+    _holder: CStringArray,
 }
+impl VulkanApp {
+    fn new(width: u32, height: u32, window_name: &str) -> Self {
+        let (glfw_var, window, events) = Self::init_window(width, height, window_name);
+        let (instance, entry, _holder) = Self::init_vulkan(&glfw_var);
+        Self {
+            glfw_var,
+            window,
+            events,
+            instance,
+            entry,
+            _holder,
+        }
+    }
+
+    fn init_window(
+        width: u32,
+        height: u32,
+        window_name: &str,
+    ) -> (
+        glfw::Glfw,
+        glfw::PWindow,
+        glfw::GlfwReceiver<(f64, glfw::WindowEvent)>,
+    ) {
+        use glfw::fail_on_errors;
+        let mut glfw = glfw::init(fail_on_errors!()).expect("Failed to init glfw init");
+        glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
+
+        let (mut window, events) = glfw
+            .create_window(width, height, window_name, glfw::WindowMode::Windowed)
+            .expect("Failed to create window");
+        window.set_key_polling(true);
+        (glfw, window, events)
+    }
+    fn init_vulkan(glfw_var: &glfw::Glfw) -> (ash::Instance, ash::Entry, CStringArray) {
+        let entry = Entry::linked();
+        let app_info = vk::ApplicationInfo {
+            api_version: vk::make_api_version(0, 1, 4, 0),
+            ..Default::default()
+        };
+        let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+            )
+            .pfn_user_callback(Some(callback));
+        check_layers(&entry);
+
+        let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
+            entry
+                .enumerate_instance_extension_properties(None)
+                .expect("Failed to get instance extension properties")
+        };
+        log::info!("Vulkan having extensions: {extension_properties:#?}");
+
+        let glfw_extensions: Vec<String> = glfw_var
+            .get_required_instance_extensions()
+            .expect("glfw api unavaible");
+
+        if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
+            log::info!("extension = {glfw_extension}");
+            let ext: CString = CString::new(glfw_extension).expect("Ahhh failed to get CString");
+            let cstring_vec: Vec<&CStr> = extension_properties
+                .iter()
+                .map(|prop| prop.extension_name_as_c_str().unwrap())
+                .collect();
+
+            cstring_vec.contains(&ext.as_ref())
+        }) {
+            panic!("Some extensions is missing");
+        }
+        // must live as long as app and dropped manually at the end
+        let layers = CStringArray::from(LAYERS_TO_ENABLE);
+        let instance = create_instance(
+            glfw_extensions,
+            &app_info,
+            &entry,
+            &layers,
+            &mut debug_create_info,
+        );
+        (instance, entry, layers)
+    }
+}
+
 fn check_layers(entry: &ash::Entry) {
     let layer_properties = unsafe {
         (*entry)
@@ -180,72 +255,20 @@ extern "system" fn callback(
 fn main() {
     env_logger::init();
     log::info!("Initialized logger");
+    let mut v_app = VulkanApp::new(SCREEN_WIDTH, SCREEN_HEIGHT, "tryingVULKAN!!!!");
 
-    let (mut glfw, mut window, events) =
-        init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "tryingVULKAN!!!");
-
-    let entry = Entry::linked();
-    let app_info = vk::ApplicationInfo {
-        api_version: vk::make_api_version(0, 1, 4, 0),
-        ..Default::default()
-    };
-    let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-        .message_severity(
-            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-        )
-        .message_type(
-            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-        )
-        .pfn_user_callback(Some(callback));
-    check_layers(&entry);
-
-    let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
-        entry
-            .enumerate_instance_extension_properties(None)
-            .expect("Failed to get instance extension properties")
-    };
-    log::info!("Vulkan having extensions: {extension_properties:#?}");
-
-    let glfw_extensions: Vec<String> = glfw
-        .get_required_instance_extensions()
-        .expect("glfw api unavaible");
-
-    if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
-        log::info!("extension = {glfw_extension}");
-        let ext: CString = CString::new(glfw_extension).expect("Ahhh failed to get CString");
-        let cstring_vec: Vec<&CStr> = extension_properties
-            .iter()
-            .map(|prop| prop.extension_name_as_c_str().unwrap())
-            .collect();
-
-        cstring_vec.contains(&ext.as_ref())
-    }) {
-        panic!("Some extensions is missing");
-    }
-    // must live as long as app and dropped manually at the end
-    let layers = CStringArray::from(LAYERS_TO_ENABLE);
-    let instance = create_instance(
-        glfw_extensions,
-        &app_info,
-        &entry,
-        &layers,
-        &mut debug_create_info,
-    );
     // pick window surface
     let surface = unsafe {
         let mut surface: vk::SurfaceKHR = vk::SurfaceKHR::null();
         log::trace!("SurfaceKHR::null()");
-        let instance = instance.handle().as_raw() as *mut VkInstance_T;
+        let instance = v_app.instance.handle().as_raw() as *mut VkInstance_T;
         log::trace!("instance.handle() ...");
         let surface_ptr: *mut vk::SurfaceKHR = &mut surface;
         // let mut surf = [std::ptr::from_ref(&surface).cast_mut()].as_mut_ptr();
         log::trace!("before trying create window");
-        window.create_window_surface(instance, std::ptr::null(), surface_ptr as *mut _);
+        v_app
+            .window
+            .create_window_surface(instance, std::ptr::null(), surface_ptr as *mut _);
         log::trace!("after");
         surface
     };
@@ -258,10 +281,13 @@ fn main() {
         khr::synchronization2::NAME,
         khr::create_renderpass2::NAME,
     ];
-    let main_device = select_physical_device(&instance, &device_extension);
+    let main_device = select_physical_device(&v_app.instance, &device_extension);
     //logical device
-    let queue_family_properties =
-        unsafe { instance.get_physical_device_queue_family_properties(main_device) };
+    let queue_family_properties = unsafe {
+        v_app
+            .instance
+            .get_physical_device_queue_family_properties(main_device)
+    };
     let graphics_index = queue_family_properties
         .iter()
         .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
@@ -275,11 +301,11 @@ fn main() {
         queue_count: 1,
         ..Default::default()
     };
-    let device = create_logical_device(device_extension, &instance, log_device, main_device);
+    let device = create_logical_device(device_extension, &v_app.instance, log_device, main_device);
 
     let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
 
-    let surf_instance = khr::surface::Instance::new(&entry, &instance);
+    let surf_instance = khr::surface::Instance::new(&v_app.entry, &v_app.instance);
 
     let present_supported: bool = unsafe {
         surf_instance
@@ -307,22 +333,138 @@ fn main() {
             .get_physical_device_surface_present_modes(main_device, surface)
             .unwrap()
     };
+    create_swap_chain(
+        &v_app.window,
+        surface_capabilites,
+        available_present_modes,
+        available_formats,
+        surface,
+        graphics_index as u32,
+        present_index as u32,
+        &v_app.entry,
+        &v_app.instance,
+        &device,
+    );
 
-    while !window.should_close() {
+    while !v_app.window.should_close() {
         // Swap front and back buffers
 
         // Poll for and process events
-        glfw.poll_events();
-        for (_, event) in glfw::flush_messages(&events) {
+        v_app.glfw_var.poll_events();
+        for (_, event) in glfw::flush_messages(&(v_app.events)) {
             println!("{event:?}");
             if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
-                window.set_should_close(true)
+                v_app.window.set_should_close(true)
             }
         }
     }
     unsafe { device.destroy_device(None) };
-    unsafe { instance.destroy_instance(None) };
-    mem::drop(layers);
+    unsafe { v_app.instance.destroy_instance(None) };
+    mem::drop(v_app._holder);
+}
+fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    use ash::vk::*;
+    *vec.iter()
+        .find(|available| {
+            available.color_space == ColorSpaceKHR::SRGB_NONLINEAR
+                && available.format == Format::B8G8R8A8_SRGB
+        })
+        .unwrap_or(&vec[0])
+}
+fn choose_swap_present_mode(vec: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    use ash::vk::*;
+    *vec.iter()
+        .find(|available| **available == PresentModeKHR::MAILBOX)
+        .unwrap_or(&PresentModeKHR::FIFO)
+}
+fn choose_swap_extent(
+    capabilites: &vk::SurfaceCapabilitiesKHR,
+    window: &glfw::PWindow,
+) -> vk::Extent2D {
+    if capabilites.current_extent.width != u32::MAX {
+        capabilites.current_extent
+    } else {
+        let (width, height) = window.get_size();
+        if width < 0 || height < 0 {
+            panic!("wtf width or height < 0");
+        }
+        let (min, max) = (capabilites.min_image_extent, capabilites.max_image_extent);
+        vk::Extent2D {
+            width: (width as u32).clamp(min.width, max.width),
+            height: (height as u32).clamp(min.height, max.height),
+        }
+    }
+}
+fn create_swap_chain(
+    window: &glfw::PWindow,
+    surface_capabilites: vk::SurfaceCapabilitiesKHR,
+    present_modes: Vec<vk::PresentModeKHR>,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    surface: vk::SurfaceKHR,
+    graphics_family: u32,
+    present_family: u32,
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    log_device: &ash::Device,
+) {
+    use ash::vk::*;
+    // mean true by specification
+    let clipped: Bool32 = 1_u32;
+    let pre_transform: SurfaceTransformFlagsKHR = { surface_capabilites.current_transform };
+    let swap_surface_format = choose_swap_surface_format(&formats);
+    let swap_present_mode = choose_swap_present_mode(&present_modes);
+    let swap_extend = choose_swap_extent(&surface_capabilites, window);
+    //  minImageCount = ( surfaceCapabilities.maxImageCount > 0
+    //&& minImageCount > surfaceCapabilities.maxImageCount )
+    // ? surfaceCapabilities.maxImageCount : minImageCount;
+    //
+    let mut min_image_count = 3.max(surface_capabilites.min_image_count);
+    min_image_count = if surface_capabilites.max_image_count > 0
+        && min_image_count > surface_capabilites.max_image_count
+    {
+        surface_capabilites.max_image_count
+    } else {
+        min_image_count
+    };
+    let mut image_count = surface_capabilites.min_image_count + 1;
+    if surface_capabilites.max_image_count > 0 && image_count > surface_capabilites.max_image_count
+    {
+        image_count = surface_capabilites.max_image_count;
+    }
+
+    let mut swap_chain_create_info = vk::SwapchainCreateInfoKHR {
+        flags: SwapchainCreateFlagsKHR::default(),
+        surface,
+        min_image_count,
+        image_format: swap_surface_format.format,
+        image_color_space: swap_surface_format.color_space,
+        image_extent: swap_extend,
+        image_array_layers: 1,
+        image_usage: ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode: SharingMode::EXCLUSIVE,
+        pre_transform,
+        composite_alpha: CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: swap_present_mode,
+        clipped,
+        old_swapchain: SwapchainKHR::null(),
+        ..Default::default()
+    };
+    if graphics_family != present_family {
+        swap_chain_create_info.image_sharing_mode = SharingMode::CONCURRENT;
+        swap_chain_create_info.queue_family_index_count = 2;
+        swap_chain_create_info.p_queue_family_indices = [graphics_family, present_family].as_ptr();
+    } else {
+        swap_chain_create_info.image_sharing_mode = SharingMode::EXCLUSIVE;
+        swap_chain_create_info.queue_family_index_count = 0;
+        swap_chain_create_info.p_queue_family_indices = std::ptr::null();
+    }
+    let device = ash::khr::swapchain::Device::new(instance, log_device);
+    let swapchain = unsafe {
+        device
+            .create_swapchain(&swap_chain_create_info, None)
+            .unwrap()
+    };
+    let images = unsafe { device.get_swapchain_images(swapchain).unwrap() };
 }
 fn vec_strings_to_ptptr(v_strings: Vec<String>) -> *const *const i8 {
     let c_strings: Vec<CString> = v_strings
