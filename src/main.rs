@@ -2,10 +2,7 @@
 #![warn(clippy::pedantic)]
 
 use core::panic;
-use std::{
-    ffi::{CStr, CString, c_char},
-    mem,
-};
+use std::ffi::{CStr, CString, c_char};
 
 use ash::{
     Entry,
@@ -27,6 +24,9 @@ struct VulkanInternal {
     log_device: ash::Device,
     swapchain: vk::SwapchainKHR,
 }
+// impl Drop for VulkanInternal {
+//     fn drop(&mut self) {}
+// }
 impl VulkanInternal {
     fn new(
         instance: &ash::Instance,
@@ -38,14 +38,8 @@ impl VulkanInternal {
         let phys_device = Self::select_physical_device(instance, device_extension);
         let log_device =
             Self::create_logical_device(instance, &phys_device, device_extension.clone());
-        let swapchain = Self::create_swapchain(
-            instance,
-            entry,
-            &phys_device,
-            device_extension.clone(),
-            &surface,
-            window,
-        );
+        let swapchain =
+            Self::create_swapchain(instance, entry, phys_device, surface, window, &log_device);
         Self {
             surface,
             phys_device,
@@ -57,20 +51,20 @@ impl VulkanInternal {
     fn create_surface(instance: &ash::Instance, window: &glfw::PWindow) -> ash::vk::SurfaceKHR {
         // must live as long as app and dropped manually at the end
         // pick window surface
-        let surface = unsafe {
+
+        unsafe {
             let mut surface: vk::SurfaceKHR = vk::SurfaceKHR::null();
             log::trace!("SurfaceKHR::null()");
             let instance = instance.handle().as_raw() as *mut VkInstance_T;
             log::trace!("instance.handle() ...");
-            let surface_ptr: *mut vk::SurfaceKHR = &mut surface;
+            let surface_ptr: *mut vk::SurfaceKHR = &raw mut surface;
             // let mut surf = [std::ptr::from_ref(&surface).cast_mut()].as_mut_ptr();
             log::trace!("before trying create window");
 
-            window.create_window_surface(instance, std::ptr::null(), surface_ptr as *mut _);
+            window.create_window_surface(instance, std::ptr::null(), surface_ptr.cast());
             log::trace!("after");
             surface
-        };
-        surface
+        }
     }
 
     fn select_physical_device(
@@ -85,13 +79,13 @@ impl VulkanInternal {
         assert!(!devices.is_empty(),);
         log::debug!("devices: {devices:#?}");
 
-        let mut main_device = Default::default();
-        devices.iter().for_each(|device| {
-            if is_device_suitable(device, instance, device_extension) {
+        let mut main_device = vk::PhysicalDevice::default();
+        for device in &devices {
+            if is_device_suitable(*device, instance, device_extension) {
                 log::debug!("device {device:?} is suitable");
                 main_device = *device;
             }
-        });
+        }
         main_device
     }
     fn create_logical_device(
@@ -118,12 +112,13 @@ impl VulkanInternal {
             vk::PhysicalDeviceFeatures2::default();
         let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
             dynamic_rendering: vk::TRUE,
-            p_next: &mut physical_device_features2 as *mut _ as *mut std::ffi::c_void,
+            // p_next: &mut physical_device_features2 as *mut _ as *mut std::ffi::c_void,
+            p_next: (&raw mut physical_device_features2).cast::<std::ffi::c_void>(),
             ..Default::default()
         };
         let mut extended_state_features_ext = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
             extended_dynamic_state: vk::TRUE,
-            p_next: &mut vulkan13_features as *mut _ as *mut std::ffi::c_void,
+            p_next: (&raw mut vulkan13_features).cast::<std::ffi::c_void>(),
             ..Default::default()
         };
 
@@ -131,9 +126,9 @@ impl VulkanInternal {
         // must live as long as device or SEGFAULT_CORE_DUMPED))))
         let vec_with_cstrings = CStringArray::from(device_extension);
         let device_create_info = vk::DeviceCreateInfo {
-            p_next: &mut extended_state_features_ext as *mut _ as *mut std::ffi::c_void,
+            p_next: (&raw mut extended_state_features_ext).cast::<std::ffi::c_void>(),
             queue_create_info_count: 1,
-            p_queue_create_infos: &log_device_create_info,
+            p_queue_create_infos: &raw const log_device_create_info,
             enabled_extension_count: len_of_device_extensions as u32,
             pp_enabled_extension_names: vec_with_cstrings.as_ptr(),
             ..Default::default()
@@ -147,35 +142,23 @@ impl VulkanInternal {
     fn create_swapchain(
         instance: &ash::Instance,
         entry: &ash::Entry,
-        phys_device: &vk::PhysicalDevice,
-        device_extension: Vec<&CStr>,
-        surface: &vk::SurfaceKHR,
+        phys_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
         window: &glfw::PWindow,
+        log_device: &ash::Device,
     ) -> vk::SwapchainKHR {
         let queue_family_properties =
-            unsafe { instance.get_physical_device_queue_family_properties(*phys_device) };
+            unsafe { instance.get_physical_device_queue_family_properties(phys_device) };
         let graphics_index = queue_family_properties
             .iter()
             .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
             .unwrap();
 
-        // create this var for sure what ptr will be valid as long as app run
-        let queue_priority = 0.0f32;
-        let log_device = vk::DeviceQueueCreateInfo {
-            queue_family_index: graphics_index as u32,
-            p_queue_priorities: std::ptr::addr_of!(queue_priority),
-            queue_count: 1,
-            ..Default::default()
-        };
-        let device = create_logical_device(device_extension, instance, log_device, *phys_device);
-
-        let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
-
         let surf_instance = khr::surface::Instance::new(entry, instance);
 
         let present_supported: bool = unsafe {
             surf_instance
-                .get_physical_device_surface_support(*phys_device, graphics_index as u32, *surface)
+                .get_physical_device_surface_support(phys_device, graphics_index as u32, surface)
                 .unwrap()
         };
         log::trace!("present supported {present_supported:?}");
@@ -184,20 +167,19 @@ impl VulkanInternal {
         } else {
             panic!()
         };
-        let present_queue = unsafe { device.get_device_queue(present_index as u32, 0) };
         let surface_capabilites = unsafe {
             surf_instance
-                .get_physical_device_surface_capabilities(*phys_device, *surface)
+                .get_physical_device_surface_capabilities(phys_device, surface)
                 .unwrap()
         };
         let available_formats = unsafe {
             surf_instance
-                .get_physical_device_surface_formats(*phys_device, *surface)
+                .get_physical_device_surface_formats(phys_device, surface)
                 .unwrap()
         };
         let available_present_modes = unsafe {
             surf_instance
-                .get_physical_device_surface_present_modes(*phys_device, *surface)
+                .get_physical_device_surface_present_modes(phys_device, surface)
                 .unwrap()
         };
         create_swap_chain(
@@ -205,11 +187,11 @@ impl VulkanInternal {
             surface_capabilites,
             available_present_modes,
             available_formats,
-            *surface,
+            surface,
             graphics_index as u32,
             present_index as u32,
             instance,
-            &device,
+            log_device,
         )
     }
 }
@@ -257,7 +239,6 @@ impl VulkanApp {
         (glfw, window, events)
     }
     fn init_vulkan(glfw_var: &glfw::Glfw) -> (ash::Instance, ash::Entry, CStringArray) {
-        // createSwapChain();
         let entry = Entry::linked();
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 4, 0),
@@ -378,50 +359,14 @@ fn select_physical_device(
     assert!(!devices.is_empty(),);
     log::debug!("devices: {devices:#?}");
 
-    let mut main_device = Default::default();
-    devices.iter().for_each(|device| {
-        if is_device_suitable(device, instance, device_extension) {
+    let mut main_device = vk::PhysicalDevice::default();
+    for device in &devices {
+        if is_device_suitable(*device, instance, device_extension) {
             log::debug!("device {device:?} is suitable");
             main_device = *device;
         }
-    });
-    main_device
-}
-fn create_logical_device(
-    device_extension: Vec<&CStr>,
-    instance: &ash::Instance,
-    log_device_create_info: vk::DeviceQueueCreateInfo<'_>,
-    main_device: vk::PhysicalDevice,
-) -> ash::Device {
-    let mut physical_device_features2: vk::PhysicalDeviceFeatures2 =
-        vk::PhysicalDeviceFeatures2::default();
-    let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
-        dynamic_rendering: vk::TRUE,
-        p_next: &mut physical_device_features2 as *mut _ as *mut std::ffi::c_void,
-        ..Default::default()
-    };
-    let mut extended_state_features_ext = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
-        extended_dynamic_state: vk::TRUE,
-        p_next: &mut vulkan13_features as *mut _ as *mut std::ffi::c_void,
-        ..Default::default()
-    };
-
-    let len_of_device_extensions = device_extension.len();
-    // must live as long as device or SEGFAULT_CORE_DUMPED))))
-    let vec_with_cstrings = CStringArray::from(device_extension);
-    let device_create_info = vk::DeviceCreateInfo {
-        p_next: &mut extended_state_features_ext as *mut _ as *mut std::ffi::c_void,
-        queue_create_info_count: 1,
-        p_queue_create_infos: &log_device_create_info,
-        enabled_extension_count: len_of_device_extensions as u32,
-        pp_enabled_extension_names: vec_with_cstrings.as_ptr(),
-        ..Default::default()
-    };
-    unsafe {
-        instance
-            .create_device(main_device, &device_create_info, None)
-            .expect("Failed to create vk::Device")
     }
+    main_device
 }
 extern "system" fn callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -470,88 +415,6 @@ fn main() {
         device_extension.clone(),
     );
 
-    // pick window surface
-    let surface = unsafe {
-        let mut surface: vk::SurfaceKHR = vk::SurfaceKHR::null();
-        log::trace!("SurfaceKHR::null()");
-        let instance = v_app.instance.handle().as_raw() as *mut VkInstance_T;
-        log::trace!("instance.handle() ...");
-        let surface_ptr: *mut vk::SurfaceKHR = &mut surface;
-        // let mut surf = [std::ptr::from_ref(&surface).cast_mut()].as_mut_ptr();
-        log::trace!("before trying create window");
-        v_app
-            .window
-            .create_window_surface(instance, std::ptr::null(), surface_ptr as *mut _);
-        log::trace!("after");
-        surface
-    };
-
-    // select physical device
-
-    let main_device = select_physical_device(&v_app.instance, &device_extension);
-    //logical device
-    let queue_family_properties = unsafe {
-        v_app
-            .instance
-            .get_physical_device_queue_family_properties(main_device)
-    };
-    let graphics_index = queue_family_properties
-        .iter()
-        .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-        .unwrap();
-
-    // create this var for sure what ptr will be valid as long as app run
-    let queue_priority = 0.0f32;
-    let log_device = vk::DeviceQueueCreateInfo {
-        queue_family_index: graphics_index as u32,
-        p_queue_priorities: std::ptr::addr_of!(queue_priority),
-        queue_count: 1,
-        ..Default::default()
-    };
-    let device = create_logical_device(device_extension, &v_app.instance, log_device, main_device);
-
-    let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
-
-    let surf_instance = khr::surface::Instance::new(&v_app.entry, &v_app.instance);
-
-    let present_supported: bool = unsafe {
-        surf_instance
-            .get_physical_device_surface_support(main_device, graphics_index as u32, surface)
-            .unwrap()
-    };
-    log::trace!("present supported {present_supported:?}");
-    let present_index = match present_supported {
-        true => graphics_index,
-        false => panic!(),
-    };
-    let present_queue = unsafe { device.get_device_queue(present_index as u32, 0) };
-    let surface_capabilites = unsafe {
-        surf_instance
-            .get_physical_device_surface_capabilities(main_device, surface)
-            .unwrap()
-    };
-    let available_formats = unsafe {
-        surf_instance
-            .get_physical_device_surface_formats(main_device, surface)
-            .unwrap()
-    };
-    let available_present_modes = unsafe {
-        surf_instance
-            .get_physical_device_surface_present_modes(main_device, surface)
-            .unwrap()
-    };
-    create_swap_chain(
-        &v_app.window,
-        surface_capabilites,
-        available_present_modes,
-        available_formats,
-        surface,
-        graphics_index as u32,
-        present_index as u32,
-        &v_app.instance,
-        &device,
-    );
-
     while !v_app.window.should_close() {
         // Swap front and back buffers
 
@@ -564,9 +427,6 @@ fn main() {
             }
         }
     }
-    unsafe { device.destroy_device(None) };
-    unsafe { v_app.instance.destroy_instance(None) };
-    mem::drop(v_app._holder);
 }
 fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     use ash::vk::*;
@@ -614,8 +474,7 @@ fn create_swap_chain(
         Bool32, CompositeAlphaFlagsKHR, ImageUsageFlags, SharingMode, SurfaceTransformFlagsKHR,
         SwapchainCreateFlagsKHR, SwapchainKHR,
     };
-    // mean true by specification
-    let clipped: Bool32 = 1_u32;
+    let clipped: Bool32 = vk::TRUE;
     let pre_transform: SurfaceTransformFlagsKHR = { surface_capabilites.current_transform };
     let swap_surface_format = choose_swap_surface_format(&formats);
     let swap_present_mode = choose_swap_present_mode(&present_modes);
@@ -728,20 +587,19 @@ impl From<&[&str]> for CStringArray {
     }
 }
 fn is_device_suitable(
-    device: &vk::PhysicalDevice,
+    device: vk::PhysicalDevice,
     instance: &ash::Instance,
     must_have_extension: &Vec<&CStr>,
 ) -> bool {
-    let properties = unsafe { (*instance).get_physical_device_properties(*device) };
+    let properties = unsafe { (*instance).get_physical_device_properties(device) };
     log::trace!("device: {device:?} properties: {properties:?}");
-    let features = unsafe { (*instance).get_physical_device_features(*device) };
+    let features = unsafe { (*instance).get_physical_device_features(device) };
     log::trace!("device : {device:?} features: {features:?}");
-    let queue_families =
-        unsafe { (*instance).get_physical_device_queue_family_properties(*device) };
+    let queue_families = unsafe { (*instance).get_physical_device_queue_family_properties(device) };
 
     let extension_properties = unsafe {
         (*instance)
-            .enumerate_device_extension_properties(*device)
+            .enumerate_device_extension_properties(device)
             .expect("Can't get device extension properties")
     };
     let extensions: Vec<&CStr> = extension_properties
