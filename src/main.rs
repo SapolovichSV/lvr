@@ -21,100 +21,39 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
 #[cfg(not(debug_assertions))]
 const layers_to_enable: &[&str] = &[]; // В релизе слои отключены
-struct VulkanApp {
-    glfw_var: glfw::Glfw,
-    window: glfw::PWindow,
-    events: GlfwReceiver<(f64, glfw::WindowEvent)>,
-    instance: ash::Instance,
-    entry: ash::Entry,
-    _holder: CStringArray,
+struct VulkanInternal {
+    surface: vk::SurfaceKHR,
+    phys_device: vk::PhysicalDevice,
+    log_device: ash::Device,
+    swapchain: vk::SwapchainKHR,
 }
-impl VulkanApp {
-    fn new(width: u32, height: u32, window_name: &str, device_extension: Vec<&CStr>) -> Self {
-        let (glfw_var, window, events) = Self::init_window(width, height, window_name);
-        let (instance, entry, _holder) = Self::init_vulkan(&glfw_var, &window, &device_extension);
-        Self {
-            glfw_var,
-            window,
-            events,
+impl VulkanInternal {
+    fn new(
+        instance: &ash::Instance,
+        entry: &ash::Entry,
+        window: &glfw::PWindow,
+        device_extension: &Vec<&CStr>,
+    ) -> Self {
+        let surface = Self::create_surface(instance, window);
+        let phys_device = Self::select_physical_device(instance, device_extension);
+        let log_device =
+            Self::create_logical_device(instance, &phys_device, device_extension.clone());
+        let swapchain = Self::create_swapchain(
             instance,
             entry,
-            _holder,
-        }
-    }
-
-    fn init_window(
-        width: u32,
-        height: u32,
-        window_name: &str,
-    ) -> (
-        glfw::Glfw,
-        glfw::PWindow,
-        glfw::GlfwReceiver<(f64, glfw::WindowEvent)>,
-    ) {
-        use glfw::fail_on_errors;
-        let mut glfw = glfw::init(fail_on_errors!()).expect("Failed to init glfw init");
-        glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
-
-        let (mut window, events) = glfw
-            .create_window(width, height, window_name, glfw::WindowMode::Windowed)
-            .expect("Failed to create window");
-        window.set_key_polling(true);
-        (glfw, window, events)
-    }
-    fn init_vulkan(
-        glfw_var: &glfw::Glfw,
-        window: &glfw::PWindow,
-
-        device_extension: &Vec<&CStr>,
-    ) -> (ash::Instance, ash::Entry, CStringArray) {
-        // createLogicalDevice();
-        // createSwapChain();
-        let entry = Entry::linked();
-        let app_info = vk::ApplicationInfo {
-            api_version: vk::make_api_version(0, 1, 4, 0),
-            ..Default::default()
-        };
-        let mut debug_create_info = setup_debug_messenger(Some(callback));
-        check_layers(&entry);
-
-        let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
-            entry
-                .enumerate_instance_extension_properties(None)
-                .expect("Failed to get instance extension properties")
-        };
-        log::info!("Vulkan having extensions: {extension_properties:#?}");
-
-        let glfw_extensions: Vec<String> = glfw_var
-            .get_required_instance_extensions()
-            .expect("glfw api unavaible");
-
-        if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
-            log::info!("extension = {glfw_extension}");
-            let ext: CString = CString::new(glfw_extension).expect("Ahhh failed to get CString");
-            let cstring_vec: Vec<&CStr> = extension_properties
-                .iter()
-                .map(|prop| prop.extension_name_as_c_str().unwrap())
-                .collect();
-
-            cstring_vec.contains(&ext.as_ref())
-        }) {
-            panic!("Some extensions is missing");
-        }
-        let layers = CStringArray::from(LAYERS_TO_ENABLE);
-        let instance = create_instance(
-            glfw_extensions,
-            &app_info,
-            &entry,
-            &layers,
-            &mut debug_create_info,
+            &phys_device,
+            device_extension.clone(),
+            &surface,
+            window,
         );
-        let surface = Self::create_surface(&instance, window);
-        let phys_device = Self::select_physical_device(&instance, device_extension);
-        let log_device =
-            Self::create_logical_device(&instance, &phys_device, device_extension.clone());
-        (instance, entry, layers)
+        Self {
+            surface,
+            phys_device,
+            log_device,
+            swapchain,
+        }
     }
+
     fn create_surface(instance: &ash::Instance, window: &glfw::PWindow) -> ash::vk::SurfaceKHR {
         // must live as long as app and dropped manually at the end
         // pick window surface
@@ -204,6 +143,161 @@ impl VulkanApp {
                 .create_device(*phys_device, &device_create_info, None)
                 .expect("Failed to create vk::Device")
         }
+    }
+    fn create_swapchain(
+        instance: &ash::Instance,
+        entry: &ash::Entry,
+        phys_device: &vk::PhysicalDevice,
+        device_extension: Vec<&CStr>,
+        surface: &vk::SurfaceKHR,
+        window: &glfw::PWindow,
+    ) -> vk::SwapchainKHR {
+        let queue_family_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(*phys_device) };
+        let graphics_index = queue_family_properties
+            .iter()
+            .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .unwrap();
+
+        // create this var for sure what ptr will be valid as long as app run
+        let queue_priority = 0.0f32;
+        let log_device = vk::DeviceQueueCreateInfo {
+            queue_family_index: graphics_index as u32,
+            p_queue_priorities: std::ptr::addr_of!(queue_priority),
+            queue_count: 1,
+            ..Default::default()
+        };
+        let device = create_logical_device(device_extension, instance, log_device, *phys_device);
+
+        let graphics_queue = unsafe { device.get_device_queue(graphics_index as u32, 0) };
+
+        let surf_instance = khr::surface::Instance::new(entry, instance);
+
+        let present_supported: bool = unsafe {
+            surf_instance
+                .get_physical_device_surface_support(*phys_device, graphics_index as u32, *surface)
+                .unwrap()
+        };
+        log::trace!("present supported {present_supported:?}");
+        let present_index = if present_supported {
+            graphics_index
+        } else {
+            panic!()
+        };
+        let present_queue = unsafe { device.get_device_queue(present_index as u32, 0) };
+        let surface_capabilites = unsafe {
+            surf_instance
+                .get_physical_device_surface_capabilities(*phys_device, *surface)
+                .unwrap()
+        };
+        let available_formats = unsafe {
+            surf_instance
+                .get_physical_device_surface_formats(*phys_device, *surface)
+                .unwrap()
+        };
+        let available_present_modes = unsafe {
+            surf_instance
+                .get_physical_device_surface_present_modes(*phys_device, *surface)
+                .unwrap()
+        };
+        create_swap_chain(
+            window,
+            surface_capabilites,
+            available_present_modes,
+            available_formats,
+            *surface,
+            graphics_index as u32,
+            present_index as u32,
+            instance,
+            &device,
+        )
+    }
+}
+struct VulkanApp {
+    glfw_var: glfw::Glfw,
+    window: glfw::PWindow,
+    events: GlfwReceiver<(f64, glfw::WindowEvent)>,
+    instance: ash::Instance,
+    entry: ash::Entry,
+    _holder: CStringArray,
+    internal: VulkanInternal,
+}
+impl VulkanApp {
+    fn new(width: u32, height: u32, window_name: &str, device_extension: Vec<&CStr>) -> Self {
+        let (glfw_var, window, events) = Self::init_window(width, height, window_name);
+        let (instance, entry, holder) = Self::init_vulkan(&glfw_var);
+        Self {
+            internal: VulkanInternal::new(&instance, &entry, &window, &device_extension),
+            glfw_var,
+            window,
+            events,
+            instance,
+            entry,
+            _holder: holder,
+        }
+    }
+
+    fn init_window(
+        width: u32,
+        height: u32,
+        window_name: &str,
+    ) -> (
+        glfw::Glfw,
+        glfw::PWindow,
+        glfw::GlfwReceiver<(f64, glfw::WindowEvent)>,
+    ) {
+        use glfw::fail_on_errors;
+        let mut glfw = glfw::init(fail_on_errors!()).expect("Failed to init glfw init");
+        glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
+
+        let (mut window, events) = glfw
+            .create_window(width, height, window_name, glfw::WindowMode::Windowed)
+            .expect("Failed to create window");
+        window.set_key_polling(true);
+        (glfw, window, events)
+    }
+    fn init_vulkan(glfw_var: &glfw::Glfw) -> (ash::Instance, ash::Entry, CStringArray) {
+        // createSwapChain();
+        let entry = Entry::linked();
+        let app_info = vk::ApplicationInfo {
+            api_version: vk::make_api_version(0, 1, 4, 0),
+            ..Default::default()
+        };
+        let mut debug_create_info = setup_debug_messenger(Some(callback));
+        check_layers(&entry);
+
+        let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
+            entry
+                .enumerate_instance_extension_properties(None)
+                .expect("Failed to get instance extension properties")
+        };
+        log::info!("Vulkan having extensions: {extension_properties:#?}");
+
+        let glfw_extensions: Vec<String> = glfw_var
+            .get_required_instance_extensions()
+            .expect("glfw api unavaible");
+
+        if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
+            log::info!("extension = {glfw_extension}");
+            let ext: CString = CString::new(glfw_extension).expect("Ahhh failed to get CString");
+            let cstring_vec: Vec<&CStr> = extension_properties
+                .iter()
+                .map(|prop| prop.extension_name_as_c_str().unwrap())
+                .collect();
+
+            cstring_vec.contains(&ext.as_ref())
+        }) {
+            panic!("Some extensions is missing");
+        }
+        let layers = CStringArray::from(LAYERS_TO_ENABLE);
+        let instance = create_instance(
+            glfw_extensions,
+            &app_info,
+            &entry,
+            &layers,
+            &mut debug_create_info,
+        );
+        (instance, entry, layers)
     }
 }
 
@@ -515,7 +609,7 @@ fn create_swap_chain(
     present_family: u32,
     instance: &ash::Instance,
     log_device: &ash::Device,
-) {
+) -> vk::SwapchainKHR {
     use ash::vk::{
         Bool32, CompositeAlphaFlagsKHR, ImageUsageFlags, SharingMode, SurfaceTransformFlagsKHR,
         SwapchainCreateFlagsKHR, SwapchainKHR,
@@ -571,12 +665,11 @@ fn create_swap_chain(
         swap_chain_create_info.p_queue_family_indices = [graphics_family, present_family].as_ptr();
     }
     let device = ash::khr::swapchain::Device::new(instance, log_device);
-    let swapchain = unsafe {
+    unsafe {
         device
             .create_swapchain(&swap_chain_create_info, None)
             .unwrap()
-    };
-    let images = unsafe { device.get_swapchain_images(swapchain).unwrap() };
+    }
 }
 fn vec_strings_to_ptptr(v_strings: Vec<String>) -> *const *const i8 {
     let c_strings: Vec<CString> = v_strings
