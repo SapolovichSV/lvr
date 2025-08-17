@@ -41,6 +41,7 @@
             vulkan-tools
             vulkan-headers
             vulkan-validation-layers
+            shader-slang
           ];
 
           # Переменные окружения для Rust

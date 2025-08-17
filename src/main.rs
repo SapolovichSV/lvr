@@ -1,5 +1,7 @@
 #![warn(clippy::cargo)]
 #![warn(clippy::pedantic)]
+mod shader;
+mod utils;
 
 use core::panic;
 use std::ffi::{CStr, CString, c_char};
@@ -23,6 +25,11 @@ struct VulkanInternal {
     phys_device: vk::PhysicalDevice,
     log_device: ash::Device,
     swapchain: vk::SwapchainKHR,
+    swapchain_device: khr::swapchain::Device,
+    swapchain_image_format: vk::SurfaceFormatKHR,
+    swapchain_extent: vk::Extent2D,
+    swapchain_images: Vec<vk::Image>,
+    swapchain_image_view: Vec<vk::ImageView>,
 }
 // impl Drop for VulkanInternal {
 //     fn drop(&mut self) {}
@@ -38,14 +45,24 @@ impl VulkanInternal {
         let phys_device = Self::select_physical_device(instance, device_extension);
         let log_device =
             Self::create_logical_device(instance, &phys_device, device_extension.clone());
-        let swapchain =
+        let (swapchain, swapchain_device, swapchain_image_format, swapchain_extent) =
             Self::create_swapchain(instance, entry, phys_device, surface, window, &log_device);
-        Self {
+        let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain).unwrap() };
+        let swapchain_image_view: Vec<vk::ImageView> = vec![];
+
+        let mut internal = Self {
             surface,
             phys_device,
             log_device,
             swapchain,
-        }
+            swapchain_device,
+            swapchain_image_format,
+            swapchain_extent,
+            swapchain_images,
+            swapchain_image_view,
+        };
+        internal.create_graphics_pipeline();
+        internal
     }
 
     fn create_surface(instance: &ash::Instance, window: &glfw::PWindow) -> ash::vk::SurfaceKHR {
@@ -146,7 +163,12 @@ impl VulkanInternal {
         surface: vk::SurfaceKHR,
         window: &glfw::PWindow,
         log_device: &ash::Device,
-    ) -> vk::SwapchainKHR {
+    ) -> (
+        vk::SwapchainKHR,
+        khr::swapchain::Device,
+        vk::SurfaceFormatKHR,
+        vk::Extent2D,
+    ) {
         let queue_family_properties =
             unsafe { instance.get_physical_device_queue_family_properties(phys_device) };
         let graphics_index = queue_family_properties
@@ -182,17 +204,51 @@ impl VulkanInternal {
                 .get_physical_device_surface_present_modes(phys_device, surface)
                 .unwrap()
         };
-        create_swap_chain(
+        let swap_surface_format = choose_swap_surface_format(&available_formats);
+        let swap_present_mode = choose_swap_present_mode(&available_present_modes);
+        let swap_extent = choose_swap_extent(&surface_capabilites, window);
+        let (swapchain, swap_device) = create_swap_chain(
             window,
-            surface_capabilites,
-            available_present_modes,
-            available_formats,
             surface,
+            swap_surface_format,
+            swap_present_mode,
+            swap_extent,
             graphics_index as u32,
             present_index as u32,
             instance,
             log_device,
-        )
+            &surface_capabilites,
+        );
+        (swapchain, swap_device, swap_surface_format, swap_extent)
+    }
+    fn create_image_views(&mut self) -> &Vec<vk::ImageView> {
+        self.swapchain_image_view.clear();
+        let image_view_create_info: vk::ImageViewCreateInfo<'_> =
+            vk::ImageViewCreateInfo::default()
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.swapchain_image_format.format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+        for image in &self.swapchain_images {
+            let image_view_create_info = image_view_create_info.image(*image);
+
+            let image_view: vk::ImageView = unsafe {
+                self.log_device
+                    .create_image_view(&image_view_create_info, None)
+                    .unwrap()
+            };
+            self.swapchain_image_view.push(image_view);
+        }
+        &self.swapchain_image_view
+    }
+    fn create_graphics_pipeline(&self) {
+        let shader_code = utils::read_file("shaders/shader.slang").unwrap();
+        let shader_module = shader::ShaderWrap::new(&self.log_device, &shader_code);
     }
 }
 struct VulkanApp {
@@ -254,9 +310,11 @@ impl VulkanApp {
         };
         log::info!("Vulkan having extensions: {extension_properties:#?}");
 
-        let glfw_extensions: Vec<String> = glfw_var
+        let mut glfw_extensions: Vec<String> = glfw_var
             .get_required_instance_extensions()
             .expect("glfw api unavaible");
+
+        glfw_extensions.push("VK_EXT_debug_utils".into());
 
         if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
             log::info!("extension = {glfw_extension}");
@@ -396,7 +454,6 @@ extern "system" fn callback(
         _ => (),
     }
 
-    // Возвращаем VK_FALSE, чтобы не прерывать выполнение
     vk::FALSE
 }
 fn main() {
@@ -414,6 +471,14 @@ fn main() {
         "tryingVULKAN!!!!",
         device_extension.clone(),
     );
+    let images: Vec<vk::Image> = unsafe {
+        v_app
+            .internal
+            .swapchain_device
+            .get_swapchain_images(v_app.internal.swapchain)
+            .unwrap()
+    };
+    let image_view: &Vec<vk::ImageView> = v_app.internal.create_image_views();
 
     while !v_app.window.should_close() {
         // Swap front and back buffers
@@ -423,13 +488,13 @@ fn main() {
         for (_, event) in glfw::flush_messages(&(v_app.events)) {
             println!("{event:?}");
             if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
-                v_app.window.set_should_close(true)
+                v_app.window.set_should_close(true);
             }
         }
     }
 }
 fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
-    use ash::vk::*;
+    use ash::vk::{ColorSpaceKHR, Format};
     *vec.iter()
         .find(|available| {
             available.color_space == ColorSpaceKHR::SRGB_NONLINEAR
@@ -438,7 +503,7 @@ fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormat
         .unwrap_or(&vec[0])
 }
 fn choose_swap_present_mode(vec: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    use ash::vk::*;
+    use ash::vk::PresentModeKHR;
     *vec.iter()
         .find(|available| **available == PresentModeKHR::MAILBOX)
         .unwrap_or(&PresentModeKHR::FIFO)
@@ -461,24 +526,22 @@ fn choose_swap_extent(
 }
 fn create_swap_chain(
     window: &glfw::PWindow,
-    surface_capabilites: vk::SurfaceCapabilitiesKHR,
-    present_modes: Vec<vk::PresentModeKHR>,
-    formats: Vec<vk::SurfaceFormatKHR>,
     surface: vk::SurfaceKHR,
+    swap_surface_format: vk::SurfaceFormatKHR,
+    swap_present_mode: vk::PresentModeKHR,
+    swap_extend: vk::Extent2D,
     graphics_family: u32,
     present_family: u32,
     instance: &ash::Instance,
     log_device: &ash::Device,
-) -> vk::SwapchainKHR {
+    surface_capabilites: &vk::SurfaceCapabilitiesKHR,
+) -> (vk::SwapchainKHR, khr::swapchain::Device) {
     use ash::vk::{
         Bool32, CompositeAlphaFlagsKHR, ImageUsageFlags, SharingMode, SurfaceTransformFlagsKHR,
         SwapchainCreateFlagsKHR, SwapchainKHR,
     };
     let clipped: Bool32 = vk::TRUE;
     let pre_transform: SurfaceTransformFlagsKHR = { surface_capabilites.current_transform };
-    let swap_surface_format = choose_swap_surface_format(&formats);
-    let swap_present_mode = choose_swap_present_mode(&present_modes);
-    let swap_extend = choose_swap_extent(&surface_capabilites, window);
     //  minImageCount = ( surfaceCapabilities.maxImageCount > 0
     //&& minImageCount > surfaceCapabilities.maxImageCount )
     // ? surfaceCapabilities.maxImageCount : minImageCount;
@@ -524,11 +587,14 @@ fn create_swap_chain(
         swap_chain_create_info.p_queue_family_indices = [graphics_family, present_family].as_ptr();
     }
     let device = ash::khr::swapchain::Device::new(instance, log_device);
-    unsafe {
-        device
-            .create_swapchain(&swap_chain_create_info, None)
-            .unwrap()
-    }
+    (
+        unsafe {
+            device
+                .create_swapchain(&swap_chain_create_info, None)
+                .unwrap()
+        },
+        device,
+    )
 }
 fn vec_strings_to_ptptr(v_strings: Vec<String>) -> *const *const i8 {
     let c_strings: Vec<CString> = v_strings
