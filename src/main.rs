@@ -1,5 +1,6 @@
 #![warn(clippy::cargo)]
 #![warn(clippy::pedantic)]
+#![allow(clippy::cast_precision_loss)]
 mod shader;
 mod utils;
 
@@ -20,6 +21,7 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
 #[cfg(not(debug_assertions))]
 const layers_to_enable: &[&str] = &[]; // В релизе слои отключены
+
 struct VulkanInternal {
     surface: vk::SurfaceKHR,
     phys_device: vk::PhysicalDevice,
@@ -30,6 +32,8 @@ struct VulkanInternal {
     swapchain_extent: vk::Extent2D,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_view: Vec<vk::ImageView>,
+    pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
 }
 // impl Drop for VulkanInternal {
 //     fn drop(&mut self) {}
@@ -49,6 +53,8 @@ impl VulkanInternal {
             Self::create_swapchain(instance, entry, phys_device, surface, window, &log_device);
         let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain).unwrap() };
         let swapchain_image_view: Vec<vk::ImageView> = vec![];
+        let pipeline_layout = vk::PipelineLayout::null();
+        let graphics_pipeline = vk::Pipeline::null();
 
         let mut internal = Self {
             surface,
@@ -60,6 +66,8 @@ impl VulkanInternal {
             swapchain_extent,
             swapchain_images,
             swapchain_image_view,
+            pipeline_layout,
+            graphics_pipeline,
         };
         internal.create_graphics_pipeline();
         internal
@@ -246,9 +254,84 @@ impl VulkanInternal {
         }
         &self.swapchain_image_view
     }
-    fn create_graphics_pipeline(&self) {
-        let shader_code = utils::read_file("shaders/shader.slang").unwrap();
+    fn create_graphics_pipeline(&mut self) {
+        log::trace!("start create graphics pipeline");
+        let vert_name_holder = CString::new("vertMain").unwrap();
+        let shader_code = utils::read_file("shaders/slang.spv");
+        // let shader_code = include_bytes!("shaders/shader.slang");
         let shader_module = shader::ShaderWrap::new(&self.log_device, &shader_code);
+        let vert_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(shader_module.handle)
+            .name(&vert_name_holder);
+        let frag_name_holder = CString::new("fragMain").unwrap();
+        let frag_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(shader_module.handle)
+            .name(&frag_name_holder);
+        let shader_stages = [vert_shader_stage_info, frag_shader_stage_info];
+
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let view_port_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .depth_bias_enable(false)
+            .depth_bias_slope_factor(1.0)
+            .line_width(1.0);
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .sample_shading_enable(false);
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false);
+        let binding = [color_blend_attachment];
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&binding)
+            .logic_op(vk::LogicOp::COPY);
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout = unsafe {
+            self.log_device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .unwrap()
+        };
+        let binding = [self.swapchain_image_format.format];
+        let mut pipeline_rendering_create_info =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&binding);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut pipeline_rendering_create_info)
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&view_port_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(vk::RenderPass::null());
+        let graphics_pipeline = unsafe {
+            self.log_device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .unwrap()[0]
+        };
+        self.pipeline_layout = pipeline_layout;
+        self.graphics_pipeline = graphics_pipeline;
+        log::trace!("succescfully created graphics pipeline!");
     }
 }
 struct VulkanApp {

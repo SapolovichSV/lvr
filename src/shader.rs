@@ -1,7 +1,7 @@
 use ash::vk;
 pub struct ShaderWrap<'a> {
     device: &'a ash::Device,
-    handle: vk::ShaderModule,
+    pub handle: vk::ShaderModule,
 }
 impl<'a> ShaderWrap<'a> {
     /// may panic
