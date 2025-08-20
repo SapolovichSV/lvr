@@ -4,7 +4,9 @@ pub struct ReadFileError(String);
 
 pub fn read_file<T: AsRef<Path>>(filename: T) -> Vec<u32> {
     log::trace!("try reading file: {}", filename.as_ref().display());
-    let data: Vec<u32> = include_bytes!("../shaders/slang.spv")
+    // let data: Vec<u32> = include_bytes!(filename.as_str());
+    let data: Vec<u32> = std::fs::read(filename)
+        .unwrap()
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();

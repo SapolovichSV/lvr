@@ -42,6 +42,7 @@
             vulkan-headers
             vulkan-validation-layers
             shader-slang
+            tokei # cargo utilites
           ];
 
           # Переменные окружения для Rust

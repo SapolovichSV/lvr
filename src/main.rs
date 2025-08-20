@@ -1,6 +1,7 @@
 #![warn(clippy::cargo)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::cast_precision_loss)]
+
 mod shader;
 mod utils;
 
@@ -10,7 +11,7 @@ use std::ffi::{CStr, CString, c_char};
 use ash::{
     Entry,
     khr::{self},
-    vk::{self, Handle, PFN_vkDebugUtilsMessengerCallbackEXT, PhysicalDeviceType},
+    vk::{self, AccessFlags2, Handle, PFN_vkDebugUtilsMessengerCallbackEXT, PhysicalDeviceType},
 };
 use glfw::{self, Action, GlfwReceiver, Key, ffi::VkInstance_T};
 
@@ -34,6 +35,8 @@ struct VulkanInternal {
     swapchain_image_view: Vec<vk::ImageView>,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
 }
 // impl Drop for VulkanInternal {
 //     fn drop(&mut self) {}
@@ -55,6 +58,8 @@ impl VulkanInternal {
         let swapchain_image_view: Vec<vk::ImageView> = vec![];
         let pipeline_layout = vk::PipelineLayout::null();
         let graphics_pipeline = vk::Pipeline::null();
+        let command_pool = vk::CommandPool::default();
+        let command_buffer = vk::CommandBuffer::default();
 
         let mut internal = Self {
             surface,
@@ -68,8 +73,12 @@ impl VulkanInternal {
             swapchain_image_view,
             pipeline_layout,
             graphics_pipeline,
+            command_pool,
+            command_buffer,
         };
         internal.create_graphics_pipeline();
+        internal.create_command_pool(instance);
+        internal.create_command_buffer();
         internal
     }
 
@@ -257,8 +266,7 @@ impl VulkanInternal {
     fn create_graphics_pipeline(&mut self) {
         log::trace!("start create graphics pipeline");
         let vert_name_holder = CString::new("vertMain").unwrap();
-        let shader_code = utils::read_file("shaders/slang.spv");
-        // let shader_code = include_bytes!("shaders/shader.slang");
+        let shader_code = utils::read_file("shaders/out/slang.spv");
         let shader_module = shader::ShaderWrap::new(&self.log_device, &shader_code);
         let vert_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
@@ -332,6 +340,164 @@ impl VulkanInternal {
         self.pipeline_layout = pipeline_layout;
         self.graphics_pipeline = graphics_pipeline;
         log::trace!("succescfully created graphics pipeline!");
+    }
+    fn create_command_pool(&mut self, instance: &ash::Instance) {
+        let graphics_index =
+            unsafe { instance.get_physical_device_queue_family_properties(self.phys_device) }
+                .iter()
+                .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .unwrap();
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(graphics_index as u32);
+        let command_pool = unsafe {
+            self.log_device
+                .create_command_pool(&pool_info, None)
+                .unwrap()
+        };
+        self.command_pool = command_pool;
+    }
+    fn create_command_buffer(&mut self) {
+        let alloc_inf = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe {
+            self.log_device
+                .allocate_command_buffers(&alloc_inf)
+                .unwrap()[0]
+        };
+        self.command_buffer = command_buffer;
+    }
+    fn record_command_buffer(&self, image_index: usize) {
+        unsafe {
+            self.log_device
+                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+        };
+        self.transition_image_layout(
+            image_index,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags2::NONE,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        );
+        let clear_color = {
+            let mut tmp = vk::ClearValue::default();
+            let color_value = {
+                let mut tmp = vk::ClearColorValue::default();
+                tmp.float32 = [0.0, 0.0, 0.0, 1.0];
+                tmp
+            };
+            tmp.color = color_value;
+            tmp
+        };
+        let attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(self.swapchain_image_view[image_index])
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear_color);
+
+        let render_area = {
+            let rect = vk::Rect2D::default();
+            let mut offset = vk::Offset2D::default();
+            offset = offset.x(0).y(0);
+
+            let extent = self.swapchain_extent;
+            rect.offset(offset).extent(extent)
+        };
+        log::trace!("render area : {render_area:?}");
+        let color_attachments = [attachment_info];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .color_attachments(&color_attachments);
+        unsafe {
+            self.log_device
+                .cmd_begin_rendering(self.command_buffer, &rendering_info);
+        }
+        unsafe {
+            self.log_device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline,
+            );
+        };
+
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(self.swapchain_extent.width as f32)
+            .height(self.swapchain_extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(self.swapchain_extent);
+        unsafe {
+            self.log_device
+                .cmd_set_viewport(self.command_buffer, 0, &[viewport]);
+            self.log_device
+                .cmd_set_scissor(self.command_buffer, 0, &[scissor]);
+        };
+        unsafe { self.log_device.cmd_draw(self.command_buffer, 3, 1, 0, 0) };
+        unsafe { self.log_device.cmd_end_rendering(self.command_buffer) };
+        self.transition_image_layout(
+            image_index,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            // not sure there must be ::None maybe should ::empty()
+            AccessFlags2::NONE,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+        );
+        unsafe {
+            self.log_device
+                .end_command_buffer(self.command_buffer)
+                .unwrap();
+        };
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn transition_image_layout(
+        &self,
+        image_index: usize,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        src_access_mask: vk::AccessFlags2,
+        dst_access_mask: vk::AccessFlags2,
+        src_stage_mask: vk::PipelineStageFlags2,
+        dst_stage_mask: vk::PipelineStageFlags2,
+    ) {
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_stage_mask)
+            .src_access_mask(src_access_mask)
+            .dst_stage_mask(dst_stage_mask)
+            .dst_access_mask(dst_access_mask)
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.swapchain_images[image_index])
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+        let binding = [barrier];
+        let dependency_info = vk::DependencyInfo::default()
+            .dependency_flags(vk::DependencyFlags::empty())
+            .image_memory_barriers(&binding);
+        unsafe {
+            self.log_device
+                .cmd_pipeline_barrier2(self.command_buffer, &dependency_info);
+        };
     }
 }
 struct VulkanApp {
@@ -573,6 +739,7 @@ fn main() {
             if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
                 v_app.window.set_should_close(true);
             }
+            // draw_frame();
         }
     }
 }
