@@ -1,4 +1,4 @@
-#![warn(clippy::cargo)]
+#![allow(clippy::cargo)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::cast_precision_loss)]
 
@@ -37,6 +37,9 @@ struct VulkanInternal {
     graphics_pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    present_complete_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    draw_fence: vk::Fence,
 }
 // impl Drop for VulkanInternal {
 //     fn drop(&mut self) {}
@@ -60,6 +63,9 @@ impl VulkanInternal {
         let graphics_pipeline = vk::Pipeline::null();
         let command_pool = vk::CommandPool::default();
         let command_buffer = vk::CommandBuffer::default();
+        let present_complete_semaphore = vk::Semaphore::null();
+        let render_finished_semaphore = vk::Semaphore::null();
+        let draw_fence = vk::Fence::null();
 
         let mut internal = Self {
             surface,
@@ -75,10 +81,14 @@ impl VulkanInternal {
             graphics_pipeline,
             command_pool,
             command_buffer,
+            present_complete_semaphore,
+            render_finished_semaphore,
+            draw_fence,
         };
         internal.create_graphics_pipeline();
         internal.create_command_pool(instance);
         internal.create_command_buffer();
+        internal.create_sync_objects();
         internal
     }
 
@@ -499,6 +509,29 @@ impl VulkanInternal {
                 .cmd_pipeline_barrier2(self.command_buffer, &dependency_info);
         };
     }
+    fn create_sync_objects(&mut self) {
+        let present_complete_semaphore = unsafe {
+            self.log_device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap()
+        };
+        let render_finished_semaphore = unsafe {
+            self.log_device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap()
+        };
+        let draw_fence = unsafe {
+            self.log_device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .unwrap()
+        };
+        self.present_complete_semaphore = present_complete_semaphore;
+        self.render_finished_semaphore = render_finished_semaphore;
+        self.draw_fence = draw_fence;
+    }
 }
 struct VulkanApp {
     glfw_var: glfw::Glfw,
@@ -587,6 +620,19 @@ impl VulkanApp {
         );
         (instance, entry, layers)
     }
+    fn draw_frame(&self) {
+        let (image_index, result) = unsafe {
+            self.internal
+                .swapchain_device
+                .acquire_next_image(
+                    self.internal.swapchain,
+                    u64::MAX,
+                    self.internal.present_complete_semaphore,
+                    vk::Fence::null(),
+                )
+                .unwrap()
+        };
+    }
 }
 
 fn setup_debug_messenger(
@@ -654,27 +700,6 @@ fn create_instance(
             .expect("can't create instance")
     }
 }
-fn select_physical_device(
-    instance: &ash::Instance,
-    device_extension: &Vec<&CStr>,
-) -> vk::PhysicalDevice {
-    let devices: Vec<vk::PhysicalDevice> = unsafe {
-        instance
-            .enumerate_physical_devices()
-            .expect("Can't enumerate physical devices")
-    };
-    assert!(!devices.is_empty(),);
-    log::debug!("devices: {devices:#?}");
-
-    let mut main_device = vk::PhysicalDevice::default();
-    for device in &devices {
-        if is_device_suitable(*device, instance, device_extension) {
-            log::debug!("device {device:?} is suitable");
-            main_device = *device;
-        }
-    }
-    main_device
-}
 extern "system" fn callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -705,6 +730,7 @@ extern "system" fn callback(
 
     vk::FALSE
 }
+
 fn main() {
     env_logger::init();
     log::info!("Initialized logger");
