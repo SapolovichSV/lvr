@@ -21,12 +21,14 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 #[cfg(debug_assertions)]
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
 #[cfg(not(debug_assertions))]
-const layers_to_enable: &[&str] = &[]; // В релизе слои отключены
+const LAYERS_TO_ENABLE: &[&str] = &[]; // В релизе слои отключены
 
 struct VulkanInternal {
     surface: vk::SurfaceKHR,
     phys_device: vk::PhysicalDevice,
     log_device: ash::Device,
+    queue_index: usize,
+    queue: vk::Queue,
     swapchain: vk::SwapchainKHR,
     swapchain_device: khr::swapchain::Device,
     swapchain_image_format: vk::SurfaceFormatKHR,
@@ -53,10 +55,19 @@ impl VulkanInternal {
     ) -> Self {
         let surface = Self::create_surface(instance, window);
         let phys_device = Self::select_physical_device(instance, device_extension);
-        let log_device =
+        let (log_device, queue_index) =
             Self::create_logical_device(instance, &phys_device, device_extension.clone());
+        let queue = unsafe { log_device.get_device_queue(queue_index as _, 0) };
         let (swapchain, swapchain_device, swapchain_image_format, swapchain_extent) =
-            Self::create_swapchain(instance, entry, phys_device, surface, window, &log_device);
+            Self::create_swapchain(
+                instance,
+                entry,
+                phys_device,
+                surface,
+                window,
+                &log_device,
+                queue_index,
+            );
         let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain).unwrap() };
         let swapchain_image_view: Vec<vk::ImageView> = vec![];
         let pipeline_layout = vk::PipelineLayout::null();
@@ -71,6 +82,8 @@ impl VulkanInternal {
             surface,
             phys_device,
             log_device,
+            queue_index,
+            queue,
             swapchain,
             swapchain_device,
             swapchain_image_format,
@@ -136,7 +149,7 @@ impl VulkanInternal {
         instance: &ash::Instance,
         phys_device: &vk::PhysicalDevice,
         device_extension: Vec<&CStr>,
-    ) -> ash::Device {
+    ) -> (ash::Device, usize) {
         let queue_family_properties =
             unsafe { instance.get_physical_device_queue_family_properties(*phys_device) };
         let graphics_index = queue_family_properties
@@ -177,11 +190,14 @@ impl VulkanInternal {
             pp_enabled_extension_names: vec_with_cstrings.as_ptr(),
             ..Default::default()
         };
-        unsafe {
-            instance
-                .create_device(*phys_device, &device_create_info, None)
-                .expect("Failed to create vk::Device")
-        }
+        (
+            unsafe {
+                instance
+                    .create_device(*phys_device, &device_create_info, None)
+                    .expect("Failed to create vk::Device")
+            },
+            graphics_index,
+        )
     }
     fn create_swapchain(
         instance: &ash::Instance,
@@ -190,19 +206,13 @@ impl VulkanInternal {
         surface: vk::SurfaceKHR,
         window: &glfw::PWindow,
         log_device: &ash::Device,
+        graphics_index: usize,
     ) -> (
         vk::SwapchainKHR,
         khr::swapchain::Device,
         vk::SurfaceFormatKHR,
         vk::Extent2D,
     ) {
-        let queue_family_properties =
-            unsafe { instance.get_physical_device_queue_family_properties(phys_device) };
-        let graphics_index = queue_family_properties
-            .iter()
-            .position(|x| x.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            .unwrap();
-
         let surf_instance = khr::surface::Instance::new(entry, instance);
 
         let present_supported: bool = unsafe {
@@ -620,6 +630,21 @@ impl VulkanApp {
         );
         (instance, entry, layers)
     }
+    fn main_loop(&mut self) {
+        while !self.window.should_close() {
+            // Swap front and back buffers
+
+            // Poll for and process events
+            self.glfw_var.poll_events();
+            for (_, event) in glfw::flush_messages(&(self.events)) {
+                println!("{event:?}");
+                if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
+                    self.window.set_should_close(true);
+                }
+            }
+            self.draw_frame();
+        }
+    }
     fn draw_frame(&self) {
         let (image_index, result) = unsafe {
             self.internal
@@ -630,6 +655,61 @@ impl VulkanApp {
                     self.internal.present_complete_semaphore,
                     vk::Fence::null(),
                 )
+                .unwrap()
+        };
+        self.internal.record_command_buffer(image_index as usize);
+        unsafe {
+            self.internal
+                .log_device
+                .reset_fences(&[self.internal.draw_fence])
+                .unwrap();
+        };
+
+        let wait_destination_stage_mask = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
+        let wait_dst_stage_mask = [wait_destination_stage_mask];
+        let cmd_buffers = [self.internal.command_buffer];
+        let wait_semaphores = [self.internal.present_complete_semaphore];
+        let signal_semaphores = [self.internal.render_finished_semaphore];
+
+        let submit_info = vk::SubmitInfo::default()
+            .wait_dst_stage_mask(&wait_dst_stage_mask)
+            .command_buffers(&cmd_buffers)
+            .wait_semaphores(&wait_semaphores)
+            .signal_semaphores(&signal_semaphores);
+        unsafe {
+            self.internal
+                .log_device
+                .queue_submit(
+                    self.internal.queue,
+                    &[submit_info],
+                    self.internal.draw_fence,
+                )
+                .unwrap();
+        };
+        loop {
+            unsafe {
+                match self.internal.log_device.wait_for_fences(
+                    &[self.internal.draw_fence],
+                    true,
+                    u64::MAX,
+                ) {
+                    Ok(()) => break,
+                    Err(vk::Result::TIMEOUT) => (),
+                    Err(e) => panic!("fail with e: {e}"),
+                }
+            }
+        }
+        let binding = [self.internal.render_finished_semaphore];
+        let binding2 = [self.internal.swapchain];
+        let binding3 = [image_index];
+        let present_info_khr = vk::PresentInfoKHR::default()
+            .wait_semaphores(&binding)
+            .swapchains(&binding2)
+            .image_indices(&binding3);
+        let result = unsafe {
+            self.internal
+                .swapchain_device
+                .queue_present(self.internal.queue, &present_info_khr)
                 .unwrap()
         };
     }
@@ -754,21 +834,9 @@ fn main() {
             .unwrap()
     };
     let image_view: &Vec<vk::ImageView> = v_app.internal.create_image_views();
-
-    while !v_app.window.should_close() {
-        // Swap front and back buffers
-
-        // Poll for and process events
-        v_app.glfw_var.poll_events();
-        for (_, event) in glfw::flush_messages(&(v_app.events)) {
-            println!("{event:?}");
-            if let glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) = event {
-                v_app.window.set_should_close(true);
-            }
-            // draw_frame();
-        }
-    }
+    v_app.main_loop();
 }
+
 fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     use ash::vk::{ColorSpaceKHR, Format};
     *vec.iter()
@@ -818,11 +886,8 @@ fn create_swap_chain(
     };
     let clipped: Bool32 = vk::TRUE;
     let pre_transform: SurfaceTransformFlagsKHR = { surface_capabilites.current_transform };
-    //  minImageCount = ( surfaceCapabilities.maxImageCount > 0
-    //&& minImageCount > surfaceCapabilities.maxImageCount )
-    // ? surfaceCapabilities.maxImageCount : minImageCount;
-    //
     let mut min_image_count = 3.max(surface_capabilites.min_image_count);
+
     min_image_count = if surface_capabilites.max_image_count > 0
         && min_image_count > surface_capabilites.max_image_count
     {
