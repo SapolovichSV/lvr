@@ -17,6 +17,7 @@ use glfw::{self, Action, GlfwReceiver, Key, ffi::VkInstance_T};
 
 static SCREEN_WIDTH: u32 = 1920;
 static SCREEN_HEIGHT: u32 = 1080;
+static MAX_FRAMES_IN_FLIGHT: usize = 2;
 const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 #[cfg(debug_assertions)]
 const LAYERS_TO_ENABLE: &[&str] = VALIDATION_LAYERS;
@@ -43,21 +44,72 @@ struct VulkanInternal {
     render_finished_semaphore: vk::Semaphore,
     draw_fence: vk::Fence,
 }
-// impl Drop for VulkanInternal {
-//     fn drop(&mut self) {}
-// }
+impl Drop for VulkanInternal {
+    fn drop(&mut self) {
+        unsafe {
+            // Destroy synchronization objects
+            self.log_device
+                .destroy_semaphore(self.present_complete_semaphore, None);
+            self.log_device
+                .destroy_semaphore(self.render_finished_semaphore, None);
+            self.log_device.destroy_fence(self.draw_fence, None);
+
+            // Destroy command buffers and pool
+            self.log_device
+                .destroy_command_pool(self.command_pool, None);
+
+            // Destroy pipeline and layout
+            self.log_device
+                .destroy_pipeline(self.graphics_pipeline, None);
+            self.log_device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            // Destroy image views
+            for &image_view in &self.swapchain_image_view {
+                self.log_device.destroy_image_view(image_view, None);
+            }
+
+            // Destroy swapchain
+            self.swapchain_device
+                .destroy_swapchain(self.swapchain, None);
+
+            // Destroy device and surface
+            self.log_device.destroy_device(None);
+            // Note: Surface will be destroyed when the instance is destroyed
+        }
+    }
+}
 impl VulkanInternal {
+    /// Creates a new VulkanInternal instance with all necessary resources
+    ///
+    /// # Arguments
+    /// * `instance` - The Vulkan instance
+    /// * `entry` - The Vulkan entry point
+    /// * `window` - The GLFW window to render to
+    /// * `device_extension` - The device extensions to enable
+    ///
+    /// # Returns
+    /// * A fully initialized VulkanInternal
     fn new(
         instance: &ash::Instance,
         entry: &ash::Entry,
         window: &glfw::PWindow,
         device_extension: &Vec<&CStr>,
     ) -> Self {
+        // Create the Vulkan surface for the window
         let surface = Self::create_surface(instance, window);
+
+        // Select a physical device (GPU)
         let phys_device = Self::select_physical_device(instance, device_extension);
+
+        // Create a logical device and get the queue index
         let (log_device, queue_index) =
             Self::create_logical_device(instance, &phys_device, device_extension.clone());
+
+        // Get the queue handle
         let queue = unsafe { log_device.get_device_queue(queue_index as _, 0) };
+
+        // Create the swapchain
         let (swapchain, swapchain_device, swapchain_image_format, swapchain_extent) =
             Self::create_swapchain(
                 instance,
@@ -68,16 +120,11 @@ impl VulkanInternal {
                 &log_device,
                 queue_index,
             );
-        let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain).unwrap() };
-        let swapchain_image_view: Vec<vk::ImageView> = vec![];
-        let pipeline_layout = vk::PipelineLayout::null();
-        let graphics_pipeline = vk::Pipeline::null();
-        let command_pool = vk::CommandPool::default();
-        let command_buffer = vk::CommandBuffer::default();
-        let present_complete_semaphore = vk::Semaphore::null();
-        let render_finished_semaphore = vk::Semaphore::null();
-        let draw_fence = vk::Fence::null();
 
+        // Get the swapchain images
+        let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain).unwrap() };
+
+        // Initialize with default values to be properly set later
         let mut internal = Self {
             surface,
             phys_device,
@@ -89,15 +136,18 @@ impl VulkanInternal {
             swapchain_image_format,
             swapchain_extent,
             swapchain_images,
-            swapchain_image_view,
-            pipeline_layout,
-            graphics_pipeline,
-            command_pool,
-            command_buffer,
-            present_complete_semaphore,
-            render_finished_semaphore,
-            draw_fence,
+            swapchain_image_view: vec![],
+            pipeline_layout: vk::PipelineLayout::null(),
+            graphics_pipeline: vk::Pipeline::null(),
+            command_pool: vk::CommandPool::default(),
+            command_buffer: vk::CommandBuffer::default(),
+            present_complete_semaphore: vk::Semaphore::null(),
+            render_finished_semaphore: vk::Semaphore::null(),
+            draw_fence: vk::Fence::null(),
         };
+
+        // Initialize all required resources in the correct order
+        internal.create_image_views();
         internal.create_graphics_pipeline();
         internal.create_command_pool(instance);
         internal.create_command_buffer();
@@ -169,7 +219,7 @@ impl VulkanInternal {
             vk::PhysicalDeviceFeatures2::default();
         let mut vulkan13_features = vk::PhysicalDeviceVulkan13Features {
             dynamic_rendering: vk::TRUE,
-            // p_next: &mut physical_device_features2 as *mut _ as *mut std::ffi::c_void,
+            synchronization2: vk::TRUE,
             p_next: (&raw mut physical_device_features2).cast::<std::ffi::c_void>(),
             ..Default::default()
         };
@@ -241,10 +291,10 @@ impl VulkanInternal {
                 .get_physical_device_surface_present_modes(phys_device, surface)
                 .unwrap()
         };
-        let swap_surface_format = choose_swap_surface_format(&available_formats);
-        let swap_present_mode = choose_swap_present_mode(&available_present_modes);
-        let swap_extent = choose_swap_extent(&surface_capabilites, window);
-        let (swapchain, swap_device) = create_swap_chain(
+        let swap_surface_format = Self::choose_swap_surface_format(&available_formats);
+        let swap_present_mode = Self::choose_swap_present_mode(&available_present_modes);
+        let swap_extent = Self::choose_swap_extent(&surface_capabilites, window);
+        let (swapchain, swap_device) = Self::create_swap_chain(
             window,
             surface,
             swap_surface_format,
@@ -258,8 +308,16 @@ impl VulkanInternal {
         );
         (swapchain, swap_device, swap_surface_format, swap_extent)
     }
+    /// Image views are needed to access the swapchain images during rendering.
+    /// This function creates one image view for each swapchain image.
+    ///
+    /// # Returns
+    /// * A reference to the vector of created image views
     fn create_image_views(&mut self) -> &Vec<vk::ImageView> {
+        // Clear any existing image views
         self.swapchain_image_view.clear();
+
+        // Create a template for image view creation
         let image_view_create_info: vk::ImageViewCreateInfo<'_> =
             vk::ImageViewCreateInfo::default()
                 .view_type(vk::ImageViewType::TYPE_2D)
@@ -271,18 +329,131 @@ impl VulkanInternal {
                     base_array_layer: 0,
                     layer_count: 1,
                 });
+
+        // Create an image view for each swapchain image
         for image in &self.swapchain_images {
+            // Set the image for this specific image view
             let image_view_create_info = image_view_create_info.image(*image);
 
+            // Create the image view
             let image_view: vk::ImageView = unsafe {
                 self.log_device
                     .create_image_view(&image_view_create_info, None)
-                    .unwrap()
+                    .expect("Failed to create image view")
             };
             self.swapchain_image_view.push(image_view);
         }
+
         &self.swapchain_image_view
     }
+
+    /// Chooses the optimal surface format from available formats
+    fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+        use ash::vk::{ColorSpaceKHR, Format};
+        *vec.iter()
+            .find(|available| {
+                available.color_space == ColorSpaceKHR::SRGB_NONLINEAR
+                    && available.format == Format::B8G8R8A8_SRGB
+            })
+            .unwrap_or(&vec[0])
+    }
+
+    /// Chooses the optimal present mode from available modes
+    fn choose_swap_present_mode(vec: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+        use ash::vk::PresentModeKHR;
+        *vec.iter()
+            .find(|available| **available == PresentModeKHR::MAILBOX)
+            .unwrap_or(&PresentModeKHR::FIFO)
+    }
+
+    /// Chooses the best swap chain extent based on window size and surface capabilities
+    fn choose_swap_extent(
+        capabilites: &vk::SurfaceCapabilitiesKHR,
+        window: &glfw::PWindow,
+    ) -> vk::Extent2D {
+        if capabilites.current_extent.width == u32::MAX {
+            let (width, height) = window.get_size();
+            assert!(!(width < 0 || height < 0), "Invalid window dimensions");
+            let (min, max) = (capabilites.min_image_extent, capabilites.max_image_extent);
+            vk::Extent2D {
+                width: (width as u32).clamp(min.width, max.width),
+                height: (height as u32).clamp(min.height, max.height),
+            }
+        } else {
+            capabilites.current_extent
+        }
+    }
+
+    /// Creates a swapchain with the given parameters
+    fn create_swap_chain(
+        window: &glfw::PWindow,
+        surface: vk::SurfaceKHR,
+        swap_surface_format: vk::SurfaceFormatKHR,
+        swap_present_mode: vk::PresentModeKHR,
+        swap_extend: vk::Extent2D,
+        graphics_family: u32,
+        present_family: u32,
+        instance: &ash::Instance,
+        log_device: &ash::Device,
+        surface_capabilites: &vk::SurfaceCapabilitiesKHR,
+    ) -> (vk::SwapchainKHR, khr::swapchain::Device) {
+        use ash::vk::{
+            Bool32, CompositeAlphaFlagsKHR, ImageUsageFlags, SharingMode, SurfaceTransformFlagsKHR,
+            SwapchainCreateFlagsKHR, SwapchainKHR,
+        };
+        let clipped: Bool32 = vk::TRUE;
+        let pre_transform: SurfaceTransformFlagsKHR = surface_capabilites.current_transform;
+        let mut min_image_count = 3.max(surface_capabilites.min_image_count);
+
+        min_image_count = if surface_capabilites.max_image_count > 0
+            && min_image_count > surface_capabilites.max_image_count
+        {
+            surface_capabilites.max_image_count
+        } else {
+            min_image_count
+        };
+
+        let mut swap_chain_create_info = vk::SwapchainCreateInfoKHR {
+            flags: SwapchainCreateFlagsKHR::default(),
+            surface,
+            min_image_count,
+            image_format: swap_surface_format.format,
+            image_color_space: swap_surface_format.color_space,
+            image_extent: swap_extend,
+            image_array_layers: 1,
+            image_usage: ImageUsageFlags::COLOR_ATTACHMENT,
+            image_sharing_mode: SharingMode::EXCLUSIVE,
+            pre_transform,
+            composite_alpha: CompositeAlphaFlagsKHR::OPAQUE,
+            present_mode: swap_present_mode,
+            clipped,
+            old_swapchain: SwapchainKHR::null(),
+            ..Default::default()
+        };
+
+        // Configure queue family indices
+        if graphics_family == present_family {
+            swap_chain_create_info.image_sharing_mode = SharingMode::EXCLUSIVE;
+            swap_chain_create_info.queue_family_index_count = 0;
+            swap_chain_create_info.p_queue_family_indices = std::ptr::null();
+        } else {
+            swap_chain_create_info.image_sharing_mode = SharingMode::CONCURRENT;
+            swap_chain_create_info.queue_family_index_count = 2;
+            swap_chain_create_info.p_queue_family_indices =
+                [graphics_family, present_family].as_ptr();
+        }
+
+        let device = ash::khr::swapchain::Device::new(instance, log_device);
+        (
+            unsafe {
+                device
+                    .create_swapchain(&swap_chain_create_info, None)
+                    .unwrap()
+            },
+            device,
+        )
+    }
+
     fn create_graphics_pipeline(&mut self) {
         log::trace!("start create graphics pipeline");
         let vert_name_holder = CString::new("vertMain").unwrap();
@@ -586,31 +757,174 @@ impl VulkanApp {
         window.set_key_polling(true);
         (glfw, window, events)
     }
+    /// Initializes Vulkan, creating the instance and loading validation layers
+    ///
+    /// # Arguments
+    /// * `glfw_var` - Reference to the initialized GLFW instance
+    ///
+    /// # Returns
+    /// * A tuple containing the Vulkan instance, entry point, and validation layers
     fn init_vulkan(glfw_var: &glfw::Glfw) -> (ash::Instance, ash::Entry, CStringArray) {
+        // Get the Vulkan entry point
         let entry = Entry::linked();
+
+        // Setup application info
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 4, 0),
             ..Default::default()
         };
-        let mut debug_create_info = setup_debug_messenger(Some(callback));
-        check_layers(&entry);
 
-        let extension_properties: Vec<vk::ExtensionProperties> = unsafe {
+        // Setup debug messenger
+        let mut debug_create_info = Self::setup_debug_messenger(Some(callback));
+
+        // Verify validation layers are available
+        Self::check_layers(&entry);
+
+        // Get required GLFW extensions and add debug utils if needed
+        let mut glfw_extensions = Self::get_required_extensions(glfw_var);
+
+        // Setup validation layers
+        let layers = CStringArray::from(LAYERS_TO_ENABLE);
+
+        // Create the Vulkan instance
+        let instance = Self::create_instance(
+            glfw_extensions,
+            &app_info,
+            &entry,
+            &layers,
+            &mut debug_create_info,
+        );
+
+        (instance, entry, layers)
+    }
+
+    /// Gets the required extensions for Vulkan from GLFW and adds debug extensions if needed
+    ///
+    /// # Arguments
+    /// * `glfw_var` - Reference to the initialized GLFW instance
+    ///
+    /// # Returns
+    /// * A vector of extension names as strings
+    /// Sets up the debug messenger for Vulkan validation layers
+    ///
+    /// # Arguments
+    /// * `callback` - Function pointer to the debug callback function
+    ///
+    /// # Returns
+    /// * The debug messenger create info structure
+    fn setup_debug_messenger(
+        callback: PFN_vkDebugUtilsMessengerCallbackEXT,
+    ) -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
+        vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+            )
+            .pfn_user_callback(callback)
+    }
+
+    /// Verifies that all required validation layers are available
+    ///
+    /// # Arguments
+    /// * `entry` - The Vulkan entry point
+    ///
+    /// # Panics
+    /// * If any required layer is not available
+    fn check_layers(entry: &ash::Entry) {
+        let layer_properties = unsafe {
+            (*entry)
+                .enumerate_instance_layer_properties()
+                .expect("Why can't check layer_properites?")
+        };
+        log::debug!("have layers: {layer_properties:?}");
+        if !LAYERS_TO_ENABLE.iter().all(|layer| {
+            log::debug!("layer : {layer:?}");
+            layer_properties.iter().any(|have| {
+                let new_str = have
+                    .layer_name_as_c_str()
+                    .expect("Failed to get Cstring in layers")
+                    .to_str()
+                    .unwrap();
+                new_str == *layer
+            })
+        }) {
+            panic!("Some missing layers");
+        }
+        log::info!("layer properties: {layer_properties:?}");
+    }
+
+    /// Creates a Vulkan instance with the specified parameters
+    ///
+    /// # Arguments
+    /// * `glfw_extensions` - Vector of extension names as strings
+    /// * `app_info` - Application info for Vulkan
+    /// * `entry` - Vulkan entry point
+    /// * `layers` - Validation layers to enable
+    /// * `debug_create_info` - Debug messenger creation info
+    ///
+    /// # Returns
+    /// * The created Vulkan instance
+    fn create_instance(
+        glfw_extensions: Vec<String>,
+        app_info: &vk::ApplicationInfo<'_>,
+        entry: &ash::Entry,
+        layers: &CStringArray,
+        debug_create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT,
+    ) -> ash::Instance {
+        // Get layer names as C strings
+        let enabled_layer_c_names = layers.as_ptr();
+
+        // Convert extension names to C strings
+        let len_ext_names = glfw_extensions.len();
+        let extension_names = vec_strings_to_ptptr(glfw_extensions);
+
+        // Create the instance create info
+        let create_info = vk::InstanceCreateInfo {
+            p_application_info: app_info,
+            enabled_extension_count: len_ext_names as u32,
+            pp_enabled_extension_names: extension_names,
+            enabled_layer_count: LAYERS_TO_ENABLE.len() as u32,
+            pp_enabled_layer_names: enabled_layer_c_names,
+            ..Default::default()
+        }
+        .push_next(debug_create_info);
+
+        // Create the instance
+        unsafe {
             entry
+                .create_instance(&create_info, None)
+                .expect("Failed to create Vulkan instance")
+        }
+    }
+
+    fn get_required_extensions(glfw_var: &glfw::Glfw) -> Vec<String> {
+        // Get available extensions
+        let extension_properties = unsafe {
+            Entry::linked()
                 .enumerate_instance_extension_properties(None)
                 .expect("Failed to get instance extension properties")
         };
         log::info!("Vulkan having extensions: {extension_properties:#?}");
 
+        // Get required GLFW extensions
         let mut glfw_extensions: Vec<String> = glfw_var
             .get_required_instance_extensions()
-            .expect("glfw api unavaible");
+            .expect("GLFW API unavailable");
 
+        // Add debug utils extension
         glfw_extensions.push("VK_EXT_debug_utils".into());
 
+        // Verify all required extensions are available
         if !glfw_extensions.clone().into_iter().all(|glfw_extension| {
             log::info!("extension = {glfw_extension}");
-            let ext: CString = CString::new(glfw_extension).expect("Ahhh failed to get CString");
+            let ext: CString = CString::new(glfw_extension).expect("Failed to create CString");
             let cstring_vec: Vec<&CStr> = extension_properties
                 .iter()
                 .map(|prop| prop.extension_name_as_c_str().unwrap())
@@ -618,23 +932,13 @@ impl VulkanApp {
 
             cstring_vec.contains(&ext.as_ref())
         }) {
-            panic!("Some extensions is missing");
+            panic!("Some required extensions are missing");
         }
-        let layers = CStringArray::from(LAYERS_TO_ENABLE);
-        let instance = create_instance(
-            glfw_extensions,
-            &app_info,
-            &entry,
-            &layers,
-            &mut debug_create_info,
-        );
-        (instance, entry, layers)
+
+        glfw_extensions
     }
     fn main_loop(&mut self) {
         while !self.window.should_close() {
-            // Swap front and back buffers
-
-            // Poll for and process events
             self.glfw_var.poll_events();
             for (_, event) in glfw::flush_messages(&(self.events)) {
                 println!("{event:?}");
@@ -644,6 +948,7 @@ impl VulkanApp {
             }
             self.draw_frame();
         }
+        unsafe { self.internal.log_device.device_wait_idle().unwrap() };
     }
     fn draw_frame(&self) {
         let (image_index, result) = unsafe {
@@ -715,71 +1020,6 @@ impl VulkanApp {
     }
 }
 
-fn setup_debug_messenger(
-    callback: PFN_vkDebugUtilsMessengerCallbackEXT,
-) -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
-    vk::DebugUtilsMessengerCreateInfoEXT::default()
-        .message_severity(
-            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-        )
-        .message_type(
-            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-        )
-        .pfn_user_callback(callback)
-}
-
-fn check_layers(entry: &ash::Entry) {
-    let layer_properties = unsafe {
-        (*entry)
-            .enumerate_instance_layer_properties()
-            .expect("Why can't check layer_properites?")
-    };
-    log::debug!("have layers: {layer_properties:?}");
-    if !LAYERS_TO_ENABLE.iter().all(|layer| {
-        log::debug!("layer : {layer:?}");
-        layer_properties.iter().any(|have| {
-            let new_str = have
-                .layer_name_as_c_str()
-                .expect("Failed to get Cstring in layers")
-                .to_str()
-                .unwrap();
-            new_str == *layer
-        })
-    }) {
-        panic!("Some missing layers");
-    }
-    log::info!("layer properties: {layer_properties:?}");
-}
-fn create_instance(
-    glfw_extensions: Vec<String>,
-    app_info: &vk::ApplicationInfo<'_>,
-    entry: &ash::Entry,
-    layers: &CStringArray,
-    debug_create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT,
-) -> ash::Instance {
-    let enabled_layer_c_names = layers.as_ptr();
-    let len_ext_names = glfw_extensions.len();
-    let extension_names = vec_strings_to_ptptr(glfw_extensions);
-    let create_info = vk::InstanceCreateInfo {
-        p_application_info: app_info,
-        enabled_extension_count: len_ext_names as u32,
-        pp_enabled_extension_names: extension_names,
-        enabled_layer_count: LAYERS_TO_ENABLE.len() as u32,
-        pp_enabled_layer_names: enabled_layer_c_names,
-        ..Default::default()
-    }
-    .push_next(debug_create_info);
-    unsafe {
-        entry
-            .create_instance(&create_info, None)
-            .expect("can't create instance")
-    }
-}
 extern "system" fn callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -811,132 +1051,33 @@ extern "system" fn callback(
     vk::FALSE
 }
 
+/// Application entry point
 fn main() {
+    // Initialize logging
     env_logger::init();
     log::info!("Initialized logger");
+
+    // Define required device extensions
     let device_extension: Vec<&CStr> = vec![
-        khr::swapchain::NAME,
-        khr::spirv_1_4::NAME,
-        khr::synchronization2::NAME,
-        khr::create_renderpass2::NAME,
+        khr::swapchain::NAME,          // Required for presentation
+        khr::spirv_1_4::NAME,          // Required for shader compilation
+        khr::synchronization2::NAME,   // Required for synchronization
+        khr::create_renderpass2::NAME, // Required for rendering
     ];
+
+    // Create and initialize the Vulkan application
     let mut v_app = VulkanApp::new(
         SCREEN_WIDTH,
         SCREEN_HEIGHT,
-        "tryingVULKAN!!!!",
+        "Vulkan Renderer",
         device_extension.clone(),
     );
-    let images: Vec<vk::Image> = unsafe {
-        v_app
-            .internal
-            .swapchain_device
-            .get_swapchain_images(v_app.internal.swapchain)
-            .unwrap()
-    };
-    let image_view: &Vec<vk::ImageView> = v_app.internal.create_image_views();
+
+    // Run the main event loop
     v_app.main_loop();
 }
 
-fn choose_swap_surface_format(vec: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
-    use ash::vk::{ColorSpaceKHR, Format};
-    *vec.iter()
-        .find(|available| {
-            available.color_space == ColorSpaceKHR::SRGB_NONLINEAR
-                && available.format == Format::B8G8R8A8_SRGB
-        })
-        .unwrap_or(&vec[0])
-}
-fn choose_swap_present_mode(vec: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-    use ash::vk::PresentModeKHR;
-    *vec.iter()
-        .find(|available| **available == PresentModeKHR::MAILBOX)
-        .unwrap_or(&PresentModeKHR::FIFO)
-}
-fn choose_swap_extent(
-    capabilites: &vk::SurfaceCapabilitiesKHR,
-    window: &glfw::PWindow,
-) -> vk::Extent2D {
-    if capabilites.current_extent.width == u32::MAX {
-        let (width, height) = window.get_size();
-        assert!(!(width < 0 || height < 0), "wtf width or height < 0");
-        let (min, max) = (capabilites.min_image_extent, capabilites.max_image_extent);
-        vk::Extent2D {
-            width: (width as u32).clamp(min.width, max.width),
-            height: (height as u32).clamp(min.height, max.height),
-        }
-    } else {
-        capabilites.current_extent
-    }
-}
-fn create_swap_chain(
-    window: &glfw::PWindow,
-    surface: vk::SurfaceKHR,
-    swap_surface_format: vk::SurfaceFormatKHR,
-    swap_present_mode: vk::PresentModeKHR,
-    swap_extend: vk::Extent2D,
-    graphics_family: u32,
-    present_family: u32,
-    instance: &ash::Instance,
-    log_device: &ash::Device,
-    surface_capabilites: &vk::SurfaceCapabilitiesKHR,
-) -> (vk::SwapchainKHR, khr::swapchain::Device) {
-    use ash::vk::{
-        Bool32, CompositeAlphaFlagsKHR, ImageUsageFlags, SharingMode, SurfaceTransformFlagsKHR,
-        SwapchainCreateFlagsKHR, SwapchainKHR,
-    };
-    let clipped: Bool32 = vk::TRUE;
-    let pre_transform: SurfaceTransformFlagsKHR = { surface_capabilites.current_transform };
-    let mut min_image_count = 3.max(surface_capabilites.min_image_count);
-
-    min_image_count = if surface_capabilites.max_image_count > 0
-        && min_image_count > surface_capabilites.max_image_count
-    {
-        surface_capabilites.max_image_count
-    } else {
-        min_image_count
-    };
-    let mut image_count = surface_capabilites.min_image_count + 1;
-    if surface_capabilites.max_image_count > 0 && image_count > surface_capabilites.max_image_count
-    {
-        image_count = surface_capabilites.max_image_count;
-    }
-
-    let mut swap_chain_create_info = vk::SwapchainCreateInfoKHR {
-        flags: SwapchainCreateFlagsKHR::default(),
-        surface,
-        min_image_count,
-        image_format: swap_surface_format.format,
-        image_color_space: swap_surface_format.color_space,
-        image_extent: swap_extend,
-        image_array_layers: 1,
-        image_usage: ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: SharingMode::EXCLUSIVE,
-        pre_transform,
-        composite_alpha: CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: swap_present_mode,
-        clipped,
-        old_swapchain: SwapchainKHR::null(),
-        ..Default::default()
-    };
-    if graphics_family == present_family {
-        swap_chain_create_info.image_sharing_mode = SharingMode::EXCLUSIVE;
-        swap_chain_create_info.queue_family_index_count = 0;
-        swap_chain_create_info.p_queue_family_indices = std::ptr::null();
-    } else {
-        swap_chain_create_info.image_sharing_mode = SharingMode::CONCURRENT;
-        swap_chain_create_info.queue_family_index_count = 2;
-        swap_chain_create_info.p_queue_family_indices = [graphics_family, present_family].as_ptr();
-    }
-    let device = ash::khr::swapchain::Device::new(instance, log_device);
-    (
-        unsafe {
-            device
-                .create_swapchain(&swap_chain_create_info, None)
-                .unwrap()
-        },
-        device,
-    )
-}
+// Functions moved to impl VulkanInternal
 fn vec_strings_to_ptptr(v_strings: Vec<String>) -> *const *const i8 {
     let c_strings: Vec<CString> = v_strings
         .into_iter()
